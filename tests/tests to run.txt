@@ -1,0 +1,7 @@
+Does each field of yanndata work correctly?
+Are the obs being correctly loaded?
+Are the batches the correct size and composition
+Are the files actually backed and lazy loading?
+Are the DNA sequences being retrieved faithfully and shifted correctly?
+When using a metaanndatamodule, is the correct genomic dna being loaded for each row?
+Are the obs being shuffled correctly across all the arrays with obs dimensions when loading?
