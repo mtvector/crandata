@@ -1,0 +1,17 @@
+I would like to refactor the code in this crandata package to change the way that we're loading data.
+
+Firstly, we need to get rid of the LazyData, this is making this too complicated. What should be happening in dataloading from a MetaAnnDataModule is this: 
+
+The arrays in the CrAnData should be indexed by obs, var, or other. Layers and X are dimensioned, [obs, var, ...] Fields beginning with obs* are [obs, n], fields with var* are [var,n]. This was working okay.
+
+We are sampling on the var dimension. Once the data is collated then you can shuffle on the obs dimension using the same shuffle for all the arrays with and obs dimension. In addition MetaAnnDataModule holds the meta_obs_names, and if a given obs dimension from a dataset doesn't have all the meta_obs_names, fill those elements with nans so the arrays are the same size and can be stacked
+
+The problem we were previously having is that reading from the disk individually for every datapoint is extremely slow, we attempted to do this with the Lazy data class, but this is just leading to complex problems. Fix the relevant code in the following so that regardless of the sampling strategy, all of the indices 
+
+
+
+
+
+Write general version where every array has its dimensions named. Instead of having stereotyped ordering so we know which is obs, in AnnDataModule/MetaAnnDataModule, specify what the global order of all the dimensions should be, and order the dimensions of the arrays to follow this convention (and leave unnamed dimensions in the same order at the end). Then you should also be able to specify which dimensions to shuffle, and apply the same shuffle order to all the arrays on that dimension.
+
+We should rely on the 

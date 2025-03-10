@@ -14,7 +14,6 @@ from loguru import logger
 from scipy.sparse import spmatrix
 from tqdm import tqdm
 from .crandata import LazyData
-
 from ._genome import Genome
 from .utils import one_hot_encode_sequence
 
@@ -286,34 +285,37 @@ class AnnDataset(BaseClass):
     def _get_data_array(self, source_str: str, varname: str, shift: int = 0):
         var_idx = self.index_map[varname]
         if source_str == "X":
-            lazy_obj = self.adata.X.data  # LazyH5Array instance
-            key = (slice(None), var_idx)
-            return LazyData(lazy_obj, key, 
-                            local_obs=np.array(self.adata.obs.index),
-                            global_obs=np.array(self.adata.meta_obs_names))
-        elif source_str.startswith("layers/"):
-            key = source_str.split("/", 1)[1]
-            start_idx = self.max_stochastic_shift + shift
-            end_idx = start_idx + self.region_width
-            lazy_obj = (self.adata.layers[key].data 
-                        if hasattr(self.adata.layers[key], "data") else None)
-            if lazy_obj is not None:
-                key_tuple = (self.meta_obs_names, var_idx, slice(start_idx, end_idx))
-                return LazyData(lazy_obj, key_tuple,
+            lazy_obj = self.adata.X.data  # Might be LazyH5Array OR already an array.
+            # Only wrap in LazyData if the underlying object is truly lazy.
+            if hasattr(lazy_obj, "filename"):
+                key = (slice(None), var_idx)
+                return LazyData(lazy_obj, key,
                                 local_obs=np.array(self.adata.obs.index),
                                 global_obs=np.array(self.adata.meta_obs_names))
             else:
-                arr = self.adata.layers[key][self.meta_obs_names, var_idx][..., start_idx:end_idx]
-                return arr
+                # If it's already an array, return the appropriate slice.
+                return self.adata.X[:, var_idx]
+        elif source_str.startswith("layers/"):
+            key_name = source_str.split("/", 1)[1]
+            start_idx = self.max_stochastic_shift + shift
+            end_idx = start_idx + self.region_width
+            if hasattr(self.adata.layers[key_name], "data"):
+                lazy_obj = self.adata.layers[key_name].data
+                if hasattr(lazy_obj, "filename"):
+                    key_tuple = (self.meta_obs_names, var_idx, slice(start_idx, end_idx))
+                    return LazyData(lazy_obj, key_tuple,
+                                    local_obs=np.array(self.adata.obs.index),
+                                    global_obs=np.array(self.adata.meta_obs_names))
+            # Otherwise, fall back to loading immediately.
+            return self.adata.layers[key_name][self.meta_obs_names, var_idx][..., start_idx:end_idx]
         elif source_str.startswith("varp/"):
-            key = source_str.split("/", 1)[1]
-            lazy_obj = (self.adata.varp[key].data 
-                        if hasattr(self.adata.varp[key], "data") else None)
-            if lazy_obj is not None:
-                key_tuple = (var_idx,)
-                return LazyData(lazy_obj, key_tuple)
-            else:
-                return self.adata.varp[key][var_idx]
+            key_name = source_str.split("/", 1)[1]
+            if hasattr(self.adata.varp[key_name], "data"):
+                lazy_obj = self.adata.varp[key_name].data
+                if hasattr(lazy_obj, "filename"):
+                    key_tuple = (var_idx,)
+                    return LazyData(lazy_obj, key_tuple)
+            return self.adata.varp[key_name][var_idx]
         else:
             raise ValueError(f"Data source '{source_str}' is not indexable by variable.")
 
@@ -350,7 +352,6 @@ class MetaAnnDataset:
                 for local_i in range(ds_len):
                     self.global_indices.append((ds_idx, local_i))
                     self.global_probs.append(1.0)
-        self.global_indices = np.array(self.global_indices, dtype=object)
         self.global_probs = np.array(self.global_probs, dtype=float)
         total = self.global_probs.sum()
         if total > 0:
@@ -361,8 +362,12 @@ class MetaAnnDataset:
     def __len__(self):
         return len(self.global_indices)
 
-    def __getitem__(self, global_idx: int):
-        ds_idx, local_i = self.global_indices[global_idx]
+    def __getitem__(self, global_idx):
+        # If global_idx is a tuple, assume it's already (ds_idx, local_i)
+        if isinstance(global_idx, tuple):
+            ds_idx, local_i = global_idx
+        else:
+            ds_idx, local_i = self.global_indices[global_idx]
         return self.datasets[int(ds_idx)][int(local_i)]
 
     def __repr__(self):

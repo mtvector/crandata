@@ -45,6 +45,20 @@ def _to_dataarray(X, dim_names):
 # -------------------------
 # Lazy loading helper for backed arrays
 # -------------------------
+def reindex_obs_array(array: np.ndarray, local_obs: np.ndarray, global_obs: np.ndarray) -> np.ndarray:
+    """
+    Given a NumPy array whose first dimension corresponds to local observations,
+    create a new array with first dimension equal to len(global_obs).
+    For observations in local_obs, copy the values; for missing ones, fill with NaN.
+    """
+    new_shape = (len(global_obs),) + array.shape[1:]
+    new_array = np.full(new_shape, np.nan, dtype=array.dtype)
+    for i, obs in enumerate(local_obs):
+        idx = np.where(global_obs == obs)[0]
+        if idx.size:
+            new_array[idx[0]] = array[i]
+    return new_array
+
 class LazyH5Array:
     """
     A simple lazy loader that wraps an HDF5 dataset.
@@ -73,7 +87,7 @@ class LazyData:
         self.global_obs = global_obs
 
     def __array__(self, dtype=None):
-        data = self.lazy_obj.getitems(self.key)
+        data = self.lazy_obj.__getitem__(self.key)
         # If local_obs and global_obs are provided and the number of rows is less than expected,
         # reindex to pad missing observations.
         if self.local_obs is not None and self.global_obs is not None:

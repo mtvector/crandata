@@ -8,6 +8,8 @@ import torch
 from torch.utils.data import DataLoader, Sampler
 import xarray as xr
 from .crandata import LazyData
+from .crandata import reindex_obs_array
+import h5py
 
 try:
     import sparse
@@ -251,8 +253,8 @@ class AnnDataLoader:
         # If the dataset is a MetaAnnDataset, use meta-level sampling
         if isinstance(dataset, MetaAnnDataset):
             if self.stage == "train":
-                self.sampler = MetaSampler(dataset, epoch_size=self.epoch_size)
-                # self.sampler = GroupedChunkMetaSampler(dataset, epoch_size=self.epoch_size)
+                # self.sampler = MetaSampler(dataset, epoch_size=self.epoch_size)
+                self.sampler = GroupedChunkMetaSampler(dataset, epoch_size=self.epoch_size)
                 
             else:
                 self.sampler = NonShuffleMetaSampler(dataset, sort=True)
@@ -268,52 +270,25 @@ class AnnDataLoader:
                 if self.shuffle and hasattr(self.dataset, "shuffle"):
                     self.dataset.shuffle = True
 
-    # def _collate_fn(self, batch):
-    #     x = defaultdict(list)
-    #     # First, convert each sample’s keys to dense tensors.
-    #     for sample_dict in batch:
-    #         for key, val in sample_dict.items():
-    #             if isinstance(val, xr.DataArray):
-    #                 try:
-    #                     underlying = val.variable.data
-    #                 except Exception:
-    #                     underlying = None
-    #                 if sparse is not None and underlying is not None and isinstance(underlying, sparse.COO):
-    #                     # Manually densify if underlying data is sparse.
-    #                     arr = np.asarray(underlying.todense())
-    #                 else:
-    #                     arr = np.asarray(val)
-    #             else:
-    #                 arr = np.asarray(val)
-    #             # If the resulting array is scalar, expand dims.
-    #             if arr.ndim == 0:
-    #                 arr = np.expand_dims(arr, 0)
-    #             x[key].append(torch.as_tensor(arr, dtype=torch.float32))
-    #     # Now stack the list of tensors along a new batch dimension.
-    #     # We assume each sample's arrays are of shape [n_obs, ...]. After stacking,
-    #     # each key becomes a tensor of shape [n_obs, batch, ...].
-    #     for key in x:
-    #         x[key] = torch.stack(x[key], dim=1)
-    #         # Now optionally, shuffle the obs dimension (axis 0) consistently across all keys.
-    #         if self.shuffle_obs:
-    #             perm = torch.randperm(x[key].shape[0])
-    #             x[key] = x[key][perm]
-    #         if self.device is not None:
-    #             x[key] = x[key].to(self.device)
-    #     return x
-
     def batch_collate_fn(self, batch):
         """
         Collate function that groups LazyData objects by their underlying lazy_obj so that 
-        the file is opened only once per group. For each retrieved item, if the number of observations 
-        is less than len(global_obs), reindex using reindex_obs_array (which pads missing obs with NaN).
-        Non-lazy items are collated in the standard way.
-        Finally, for each key that has an observation dimension (assumed to be axis 0), the obs dimension
-        is optionally shuffled.
+        the file is opened only once per group. For non-lazy items, it explicitly densifies 
+        sparse arrays and reindexes them (padding missing obs with NaN) so that all arrays 
+        have the same observation dimension. Finally, a single permutation is applied to the 
+        obs dimension across all keys.
         """
         collated = {}
+        
+        # If we're dealing with a MetaAnnDataset, use the meta_obs_names from the first dataset.
+        global_obs = None
+        local_obs = None
+        if isinstance(self.dataset, MetaAnnDataset) and len(self.dataset.datasets) > 0:
+            global_obs = np.array(self.dataset.datasets[0].adata.meta_obs_names)
+            local_obs = np.array(self.dataset.datasets[0].adata.obs.index)
+        
         for key in batch[0]:
-            # If every sample's value for this key is a LazyData instance, process it in groups.
+            # If every sample's value for this key is a LazyData instance, process them in groups.
             if all(isinstance(sample[key], LazyData) for sample in batch):
                 groups = {}
                 for i, sample in enumerate(batch):
@@ -321,40 +296,59 @@ class AnnDataLoader:
                     group_id = id(ld.lazy_obj)
                     groups.setdefault(group_id, []).append((i, ld.key, ld))
                 results = [None] * len(batch)
-                # Process each group.
                 for group in groups.values():
                     lazy_obj = group[0][2].lazy_obj
-                    # Collect keys for the group.
                     keys = [item[1] for item in group]
-                    # Open the file once and retrieve all items.
                     with h5py.File(lazy_obj.filename, "r") as f:
                         dset = f[lazy_obj.dataset_name]
                         group_data = [dset[k] for k in keys]
-                    # For each retrieved array, reindex if necessary.
                     for j, (i, _, ld) in enumerate(group):
                         data_item = group_data[j]
+                        # Reindex if necessary.
                         if ld.global_obs is not None and data_item.shape[0] < len(ld.global_obs):
                             data_item = reindex_obs_array(data_item, ld.local_obs, ld.global_obs)
                         results[i] = data_item
-                # Stack the list of results into a tensor along a new batch dimension.
                 collated_value = torch.stack([torch.as_tensor(r, dtype=torch.float32) for r in results], dim=1)
             else:
                 # Standard collation for non-lazy items.
                 tensors = []
                 for sample in batch:
                     val = sample[key]
-                    arr = np.array(val)
+                    # If the value supports densification (e.g. a sparse array wrapped in an xarray), do so.
+                    if hasattr(val, "data") and hasattr(val.data, "todense"):
+                        arr = np.array(val.data.todense())
+                    else:
+                        arr = np.array(val)
                     if arr.ndim == 0:
                         arr = np.expand_dims(arr, 0)
+                    # If we have global_obs and the obs dimension is not the expected length, reindex.
+                    if global_obs is not None and arr.shape[0] != len(global_obs):
+                        arr = reindex_obs_array(arr, local_obs, global_obs)
                     tensors.append(torch.as_tensor(arr, dtype=torch.float32))
                 collated_value = torch.stack(tensors, dim=1)
-            # If shuffle_obs is enabled and the tensor has an observation dimension, shuffle it.
-            if self.shuffle_obs and collated_value.ndim > 0:
-                perm = torch.randperm(collated_value.shape[0])
-                collated_value = collated_value[perm]
-            if self.device is not None:
-                collated_value = collated_value.to(self.device)
             collated[key] = collated_value
+    
+        # Now compute a single permutation for the obs dimension.
+        if self.shuffle_obs:
+            # Determine the expected observation size from global_obs if available.
+            obs_dim = None
+            if global_obs is not None:
+                obs_dim = len(global_obs)
+            else:
+                # Otherwise, use the first dimension of one key.
+                for tensor in collated.values():
+                    if tensor.ndim > 0:
+                        obs_dim = tensor.shape[0]
+                        break
+            if obs_dim is not None:
+                perm = torch.randperm(obs_dim)
+                # Apply the same permutation to every key whose first dimension equals obs_dim.
+                for key in collated:
+                    if collated[key].ndim > 0 and collated[key].shape[0] == obs_dim:
+                        collated[key] = collated[key][perm]
+        if self.device is not None:
+            for key in collated:
+                collated[key] = collated[key].to(self.device)
         return collated
     
     def _create_dataset(self):

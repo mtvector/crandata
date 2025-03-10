@@ -247,7 +247,7 @@ def test_obs_shuffling(monkeypatch):
     dataset = DummyDataset()
     loader = AnnDataLoader(dataset, batch_size=1, shuffle_obs=True)
     # The collate function expects a list of samples.
-    batch = loader._collate_fn([dummy_sample, dummy_sample])
+    batch = loader.batch_collate_fn([dummy_sample, dummy_sample])
     # Each key is stacked along axis=1.
     # Since we have two samples, the expected shape is (3, 2, 3) with the same permutation applied.
     expected_sequence = np.stack([dummy_sample["sequence"][fixed_perm.numpy()]] * 2, axis=1)
