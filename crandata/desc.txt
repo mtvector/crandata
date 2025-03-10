@@ -12,6 +12,6 @@ The problem we were previously having is that reading from the disk individually
 
 
 
-Write general version where every array has its dimensions named. Instead of having stereotyped ordering so we know which is obs, in AnnDataModule/MetaAnnDataModule, specify what the global order of all the dimensions should be, and order the dimensions of the arrays to follow this convention (and leave unnamed dimensions in the same order at the end). Then you should also be able to specify which dimensions to shuffle, and apply the same shuffle order to all the arrays on that dimension.
+Write general version where every array has its dimensions named. Instead of having stereotyped ordering so we know which is obs, in AnnDataModule/MetaAnnDataModule, specify what the global order of all the dimensions should be, and order the dimensions of the arrays to follow this convention (and leave unnamed dimensions in the same order at the end). With this, we should be able to choose which which dimension will be the batch dimension, and sample the first occurance of that dimension in each batch. Then you should also be able to specify which dimensions to shuffle, and apply the same shuffle order to all the arrays on that dimension.
 
 We should rely on the 

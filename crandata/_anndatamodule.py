@@ -314,21 +314,33 @@ class MetaAnnDataModule:
             self.train_dataset = MetaAnnDataset(train_datasets)
             self.val_dataset = MetaAnnDataset(val_datasets)
             
-            for ds in self.train_dataset.datasets:  
-                # Assume each dataset is an AnnDataset that wraps a CrAnData with adata.var and augmented_probs.
-                # Group local (augmented) indices by their chunk_index (which was added to adata.var)
-                chunk_groups = defaultdict(list)
-                for local_idx, chunk in enumerate(ds.adata.var["chunk_index"].to_numpy()):
-                    # Here you may need to adjust if the augmented indices differ from the order in adata.var.
-                    chunk_groups[chunk].append(local_idx)
+            # for ds in self.train_dataset.datasets:  
+            #     # Assume each dataset is an AnnDataset that wraps a CrAnData with adata.var and augmented_probs.
+            #     # Group local (augmented) indices by their chunk_index (which was added to adata.var)
+            #     chunk_groups = defaultdict(list)
+            #     for local_idx, chunk in enumerate(ds.adata.var["chunk_index"].to_numpy()):
+            #         # Here you may need to adjust if the augmented indices differ from the order in adata.var.
+            #         chunk_groups[chunk].append(local_idx)
+            #     ds.chunk_groups = dict(chunk_groups)
+            #     # Compute the sum of the unnormalized augmented probabilities within each chunk:
+            #     chunk_weights = {}
+            #     for ch, indices in ds.chunk_groups.items():
+            #         # ds.augmented_probs should be a numpy array whose length matches the number of variables.
+            #         chunk_weights[ch] = ds.augmented_probs[indices].sum()
+            #     ds.chunk_weights = chunk_weights
+
+            for ds in self.train_dataset.datasets:
+                if "chunk_index" in ds.adata.var.columns:
+                    chunk_groups = defaultdict(list)
+                    for local_idx, chunk in enumerate(ds.adata.var["chunk_index"].to_numpy()):
+                        chunk_groups[chunk].append(local_idx)
+                else:
+                    # If missing, assume all variables belong to one chunk.
+                    chunk_groups = {0: list(range(len(ds.adata.var)))}
                 ds.chunk_groups = dict(chunk_groups)
-                # Compute the sum of the unnormalized augmented probabilities within each chunk:
-                chunk_weights = {}
-                for ch, indices in ds.chunk_groups.items():
-                    # ds.augmented_probs should be a numpy array whose length matches the number of variables.
-                    chunk_weights[ch] = ds.augmented_probs[indices].sum()
-                ds.chunk_weights = chunk_weights
-        
+                ds.chunk_weights = {ch: ds.augmented_probs[indices].sum()
+                                    for ch, indices in ds.chunk_groups.items()}
+            
             # Also compute a per-dataset (file) weight:
             file_weights = []
             for ds in self.train_dataset.datasets:

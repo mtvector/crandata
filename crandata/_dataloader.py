@@ -305,7 +305,7 @@ class AnnDataLoader:
                     for j, (i, _, ld) in enumerate(group):
                         data_item = group_data[j]
                         # Reindex if necessary.
-                        if ld.global_obs is not None and data_item.shape[0] < len(ld.global_obs):
+                        if ld.global_obs is not None and data_item.shape[0] < len(ld.global_obs) and key not in ["sequence"]:
                             data_item = reindex_obs_array(data_item, ld.local_obs, ld.global_obs)
                         results[i] = data_item
                 collated_value = torch.stack([torch.as_tensor(r, dtype=torch.float32) for r in results], dim=1)
@@ -322,7 +322,7 @@ class AnnDataLoader:
                     if arr.ndim == 0:
                         arr = np.expand_dims(arr, 0)
                     # If we have global_obs and the obs dimension is not the expected length, reindex.
-                    if global_obs is not None and arr.shape[0] != len(global_obs):
+                    if global_obs is not None and key not in ["sequence"] and arr.shape[0] != len(global_obs):
                         arr = reindex_obs_array(arr, local_obs, global_obs)
                     tensors.append(torch.as_tensor(arr, dtype=torch.float32))
                 collated_value = torch.stack(tensors, dim=1)
