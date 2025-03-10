@@ -8,7 +8,7 @@ import pytest
 import xarray as xr
 import pybigtools  # Use pybigtools instead of pyBigWig
 
-from crandata.yanndata import CrAnData
+from crandata.crandata import CrAnData
 from crandata.chrom_io import import_bigwigs, add_contact_strengths_to_varp
 from crandata._genome import Genome
 from crandata._anndatamodule import MetaAnnDataModule

@@ -57,13 +57,36 @@ class LazyH5Array:
         self.dtype = dtype
         self.chunks = chunks
 
-    def __getitem__(self, key):
+    def __getitem__(self, key):#or keys
         with h5py.File(self.filename, "r") as f:
             data = f[self.dataset_name][key]
         return data
 
     def __array__(self):
         return np.array(self[:])
+
+class LazyData:
+    def __init__(self, lazy_obj, key, local_obs=None, global_obs=None):
+        self.lazy_obj = lazy_obj
+        self.key = key  # key is a slice or list of indices
+        self.local_obs = local_obs
+        self.global_obs = global_obs
+
+    def __array__(self, dtype=None):
+        data = self.lazy_obj.getitems(self.key)
+        # If local_obs and global_obs are provided and the number of rows is less than expected,
+        # reindex to pad missing observations.
+        if self.local_obs is not None and self.global_obs is not None:
+            if data.shape[0] < len(self.global_obs):
+                data = reindex_obs_array(data, self.local_obs, self.global_obs)
+        if dtype is not None:
+            return np.array(data, dtype=dtype)
+        return np.array(data)
+
+    def __getitem__(self, subkey):
+        # For further slicing, combine the keys (this is a simplified example).
+        new_key = (self.key, subkey)
+        return LazyData(self.lazy_obj, new_key, self.local_obs, self.global_obs)
 
 # -------------------------
 # Helpers for saving/loading xarray DataArrays
@@ -72,6 +95,8 @@ def _save_xarray(f, name: str, xarr: xr.DataArray):
     """
     Save an xarray DataArray to an HDF5 dataset.
     Uses sparse routines if the underlying data is sparse.
+    This version saves only the data and the dimension names,
+    skipping storage of large coordinate arrays.
     """
     try:
         underlying = xarr.variable.data
@@ -82,31 +107,32 @@ def _save_xarray(f, name: str, xarr: xr.DataArray):
     else:
         f.create_dataset(name, data=xarr.values, compression="gzip")
     ds = f[name]
+    # Save only the dimension names (as a comma‐separated string)
     ds.attrs["dims"] = ",".join(xarr.dims)
-    for dim in xarr.dims:
-        if dim in xarr.coords:
-            ds.attrs[f"coord_{dim}"] = np.array(xarr.coords[dim].values)
+    # Do not store the coordinate arrays.
 
 def _load_xarray(f, name: str, backed: bool) -> xr.DataArray:
+    """
+    Load an xarray DataArray from an HDF5 dataset.
+    This version does not attempt to load coordinate arrays from the file.
+    Instead, it passes coords=None so that xarray will generate default
+    coordinates. These are later overwritten for the obs and var dimensions.
+    """
     dset = f[name]
     dims = dset.attrs["dims"]
     if isinstance(dims, bytes):
         dims = dims.decode("utf-8")
     dims = dims.split(",")
-    coords = {}
-    for dim in dims:
-        attr_name = f"coord_{dim}"
-        if attr_name in dset.attrs:
-            coords[dim] = dset.attrs[attr_name]
+    # Ignore any stored coordinate arrays; let xarray build defaults.
     if backed:
         lazy_obj = LazyH5Array(f.filename, name, shape=dset.shape, dtype=dset.dtype,
                                 chunks=getattr(dset, "chunks", None))
-        xarr = xr.DataArray(lazy_obj, dims=dims, coords=coords)
+        xarr = xr.DataArray(lazy_obj, dims=dims, coords=None)
         xarr.attrs["_lazy_obj"] = lazy_obj
         return xarr
     else:
         data = dset[()]
-        return xr.DataArray(data, dims=dims, coords=coords)
+        return xr.DataArray(data, dims=dims, coords=None)
 
 # -------------------------
 # Helpers for saving/loading DataFrames

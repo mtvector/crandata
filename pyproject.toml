@@ -26,7 +26,11 @@ dependencies = [
     # "crested",
     "xarray",
     "torch",
-    "pandas"
+    "pandas",
+    "numpy",
+    "pybigtools",
+    "tqdm",
+    "pyfaidx"
 ]
 
 [project.urls]

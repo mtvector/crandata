@@ -15,7 +15,8 @@ from collections import defaultdict
 import xarray as xr
 import sparse
 import h5py  # for HDF5 backing
-from .yanndata import CrAnData
+from . import crandata
+from .crandata import CrAnData
 
 # -----------------------
 # Utility functions
@@ -45,7 +46,7 @@ def _read_chromsizes(chromsizes_file: Path) -> dict[str, int]:
     chromsizes = pd.read_csv(chromsizes_file, sep="\t", header=None, names=["chrom", "size"])
     return chromsizes.set_index("chrom")["size"].to_dict()
 
-def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str) -> np.ndarray:
+def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bins: int = None) -> np.ndarray:
     bw_file = str(bw_file)
     bed_file = str(bed_file)
     with pybigtools.open(bw_file, "r") as bw:
@@ -91,14 +92,14 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str) -> n
     elif target == "raw":
         with pybigtools.open(bw_file, "r") as bw:
             lines = open(temp_bed_file.name).readlines()
-            print("Temporary BED lines:", lines)
+            # print("Temporary BED lines:", lines)
             values_list = [
                 np.array(
-                    bw.values(chrom, int(start), int(end), missing=np.nan, exact=True)
+                    bw.values(chrom, int(start), int(end), missing=0., exact=False, bins=n_bins, summary='mean')
                 )
                 for chrom, start, end in [line.split("\t")[:3] for line in lines]
             ]
-            print("Extracted values shapes:", [v.shape for v in values_list])
+            # print("Extracted values shapes:", [v.shape for v in values_list])
             values = np.vstack(values_list)
     else:
         raise ValueError(f"Unsupported target '{target}'")
@@ -199,8 +200,8 @@ def _filter_and_adjust_chromosome_data(peaks: pd.DataFrame, chrom_sizes: dict,
 # -----------------------
 # X array writing
 # -----------------------
-def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
-                      out_path, obs_index, var_index, chunk_size=1024):
+def _load_x_to_memory(bw_files, consensus_peaks, target, target_region_width,
+                      out_path, obs_index, var_index, chunk_size=1024,n_bins=None):
     """
     Write training data (extracted from bigWig files) to an HDF5 file.
     The final shape is (n_obs, n_var, seq_len).
@@ -214,6 +215,7 @@ def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
       obs_index: pandas Index for observations (rows)
       var_index: pandas Index for variables (columns)
       chunk_size: number of regions (columns) per chunk
+      n_bins: number of bins to take interpolated means, None gives full length
     Returns:
       X: an xarray DataArray backed by the HDF5 dataset with dims ["obs", "var", "seq_len"]
     """
@@ -222,7 +224,7 @@ def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
     
     # Determine sequence length using the first file.
     temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target)
+    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target,n_bins=n_bins)
     os.remove(temp_bed)
     if sample.ndim == 1:
         sample = sample.reshape(n_var, 1)
@@ -236,14 +238,14 @@ def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
                                 dtype="float32",
                                 fillvalue=np.nan)
         # Write each observation row into the dataset.
-        for i, bw_file in enumerate(bw_files):
+        for i, bw_file in tqdm(enumerate(bw_files)):
             temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-            result = _extract_values_from_bigwig(bw_file, temp_bed, target=target)
+            result = _extract_values_from_bigwig(bw_file, temp_bed, target=target,n_bins=n_bins)
             os.remove(temp_bed)
             if result.ndim == 1:
                 result = result.reshape(n_var, 1)
             dset[i, :, :] = result
-            print(f"Wrote row {i+1}/{n_obs} from {bw_file}")
+            # print(f"Wrote row {i+1}/{n_obs} from {bw_file}")
     
     # Read the dataset into a NumPy array and wrap it in an xarray DataArray.
     with h5py.File(out_path, "r") as f:
@@ -254,6 +256,72 @@ def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
                              "seq_len": np.arange(seq_len)})
     return X
 
+# def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
+#                        out_path, obs_index, var_index, chunk_size=1024, n_bins=None):
+#     """
+#     Write training data (extracted from bigWig files) to an HDF5 file.
+#     The final dataset "X" is stored in chunks and will remain on disk.
+#     Additionally, the observation and variable metadata are saved as groups.
+#     The returned xarray DataArray is backed by a LazyH5Array referencing the dataset.
+
+#     Parameters:
+#       bw_files: list of bigWig file paths (one per observation)
+#       consensus_peaks: DataFrame of consensus regions (used for creating a temporary BED)
+#       target: extraction mode (e.g. "mean", "max", "raw", etc.)
+#       target_region_width: integer width for the regions to extract
+#       out_path: path to an HDF5 file to create or overwrite
+#       obs_index: pandas Index for observations (rows)
+#       var_index: pandas Index for variables (columns)
+#       chunk_size: number of regions (columns) per chunk
+#       n_bins: number of bins to take interpolated means; if None, returns full length
+
+#     Returns:
+#       X: an xarray DataArray whose data is lazily loaded from the HDF5 dataset "X",
+#          and which has dims ["obs", "var", "seq_len"].
+#     """
+#     n_obs = len(bw_files)
+#     n_var = consensus_peaks.shape[0]
+
+#     # Determine sequence length using the first file.
+#     temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
+#     sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target, n_bins=n_bins)
+#     os.remove(temp_bed)
+#     if sample.ndim == 1:
+#         sample = sample.reshape(n_var, 1)
+#     seq_len = sample.shape[1]
+#     chunk_size = min(chunk_size, n_var)
+
+#     with h5py.File(out_path, "w") as f:
+#         # Create dataset "X" with chunking; do not load into memory.
+#         dset = f.create_dataset(
+#             "X",
+#             shape=(n_obs, n_var, seq_len),
+#             chunks=(n_obs, chunk_size, seq_len),
+#             dtype="float32",
+#             fillvalue=np.nan,
+#         )
+#         # Write each observation (row) into the dataset.
+#         for i, bw_file in enumerate(bw_files):
+#             temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
+#             result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
+#             os.remove(temp_bed)
+#             if result.ndim == 1:
+#                 result = result.reshape(n_var, 1)
+#             dset[i, :, :] = result
+#             print(f"Wrote row {i+1}/{n_obs} from {bw_file}")
+#         crandata._save_dataframe(f, "obs", pd.DataFrame(obs_index))
+#         crandata._save_dataframe(f, "var", pd.DataFrame(var_index))
+#     # Instead of reading dset back into memory, wrap it in LazyH5Array.
+#     lazy_X = crandata.LazyH5Array(out_path, "X", shape=(n_obs, n_var, seq_len), dtype=dset.dtype, chunks=dset.chunks)
+#     # Create an xarray DataArray that is backed by the lazy loader.
+#     X = xr.DataArray(lazy_X, dims=["obs", "var", "seq_len"],
+#                      coords={"obs": np.array(obs_index),
+#                              "var": np.array(var_index),
+#                              "seq_len": np.arange(seq_len)})
+    
+#     return X
+
+
 # -----------------------
 # Main import function
 # -----------------------
@@ -261,7 +329,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                        backed_path: Path, target_region_width: int | None,
                        target: str = 'raw',  # e.g. "raw", "mean", etc.
                        chromsizes_file: Path | None = None, genome: any = None,
-                       max_stochastic_shift: int = 0, chunk_size: int = 512) -> CrAnData:
+                       max_stochastic_shift: int = 0, chunk_size: int = 512, n_bins: int = None) -> CrAnData:
     """
     Import bigWig files and consensus regions to create a backed CrAnData object.
 
@@ -286,6 +354,8 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                                               applied during region adjustment. Default is 0.
         chunk_size (int, optional): Number of region columns per chunk when writing the HDF5 dataset.
                                     Default is 512.
+        n_bin (int, optional): number of bins to take interpolated means, None gives all values.
+
 
     Returns:
         CrAnData: A CrAnData object whose X attribute is backed by the HDF5 file at `backed_path`.
@@ -304,7 +374,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
            `max_stochastic_shift`. The final target width is computed as 
            `target_region_width + 2 * max_stochastic_shift`.
         5. Collect all valid bigWig files from the directory.
-        6. Use `_write_X_in_chunks` to extract the signal values from each bigWig file over the consensus 
+        6. Use `_load_x_to_memory` to extract the signal values from each bigWig file over the consensus 
            regions and write the resulting data to an HDF5 file.
         7. Create and return a CrAnData object wrapping the backed X array along with obs and var DataFrames.
     """
@@ -330,7 +400,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     
     bw_files = []
     chrom_set = set()
-    for file in os.listdir(bigwigs_folder):
+    for file in tqdm(os.listdir(bigwigs_folder)):
         file_path = os.path.join(bigwigs_folder, file)
         try:
             bw = pybigtools.open(file_path, "r")
@@ -352,19 +422,23 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     var_df = consensus_peaks.set_index("region")
     
     # Write X into an HDF5 file (backed_path) and wrap as an xarray DataArray.
-    X = _write_X_in_chunks(
+    X = _load_x_to_memory(
         bw_files, consensus_peaks, target, target_region_width,
         out_path=str(backed_path), obs_index=obs_df.index, var_index=var_df.index,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,n_bins=n_bins
     )
-    
+    var_df["chunk_index"] = np.arange(var_df.shape[0]) // chunk_size
+
     # Instead of writing obs/var to external files, we pass them directly.
     adata = CrAnData(X=X, obs=obs_df, var=var_df)
     adata.uns['params'] = {
         'target_region_width': target_region_width,
         'shifted_region_width': shifted_width,
-        'max_stochastic_shift': max_stochastic_shift
+        'max_stochastic_shift': max_stochastic_shift,
+        'chunk_size': chunk_size
     }
+    adata.to_h5(backed_path)
+    adata = CrAnData.from_h5(backed_path)
     return adata
 
 # -----------------------

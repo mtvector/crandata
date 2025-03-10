@@ -9,7 +9,7 @@ from os import PathLike
 import numpy as np
 from ._genome import Genome, _resolve_genome #Just copied from crested
 from anndata import AnnData
-from .yanndata import CrAnData
+from .crandata import CrAnData
 from ._dataloader import AnnDataLoader
 from ._dataset import AnnDataset, MetaAnnDataset
 
@@ -275,9 +275,9 @@ class MetaAnnDataModule:
         
         # Compute observation names alignment across adatas:
         if obs_alignment == 'union':
-            meta_obs_names = np.array(set().union(*[set(adata.obs_names) for adata in self.adatas]))
+            meta_obs_names = np.array(sorted(set().union(*[set(adata.obs_names) for adata in self.adatas])))
         elif obs_alignment == 'intersect':
-            meta_obs_names = np.array(set.intersection(*[set(adata.obs_names) for adata in self.adatas]))
+            meta_obs_names = np.array(sorted(set.intersection(*[set(adata.obs_names) for adata in self.adatas])))
         else:
             raise ValueError("obs_alignment must be 'union' or 'intersect'")
         self.meta_obs_names = meta_obs_names
@@ -312,6 +312,29 @@ class MetaAnnDataModule:
                 val_datasets.append(ds_val)
             self.train_dataset = MetaAnnDataset(train_datasets)
             self.val_dataset = MetaAnnDataset(val_datasets)
+            
+            # for ds in self.train_dataset.datasets:  
+            #     # Assume each dataset is an AnnDataset that wraps a CrAnData with adata.var and augmented_probs.
+            #     # Group local (augmented) indices by their chunk_index (which was added to adata.var)
+            #     chunk_groups = defaultdict(list)
+            #     for local_idx, chunk in enumerate(ds.adata.var["chunk_index"].to_numpy()):
+            #         # Here you may need to adjust if the augmented indices differ from the order in adata.var.
+            #         chunk_groups[chunk].append(local_idx)
+            #     ds.chunk_groups = dict(chunk_groups)
+            #     # Compute the sum of the unnormalized augmented probabilities within each chunk:
+            #     chunk_weights = {}
+            #     for ch, indices in ds.chunk_groups.items():
+            #         # ds.augmented_probs should be a numpy array whose length matches the number of variables.
+            #         chunk_weights[ch] = ds.augmented_probs[indices].sum()
+            #     ds.chunk_weights = chunk_weights
+        
+            # # Also compute a per-dataset (file) weight:
+            # file_weights = []
+            # for ds in self.train_dataset.datasets:
+            #     file_weights.append(ds.augmented_probs.sum())
+            # self.file_weights = np.array(file_weights)
+            # # Normalize to get file probabilities:
+            # self.file_probs = self.file_weights / self.file_weights.sum()
 
         elif stage == "test":
             test_datasets = []
@@ -341,6 +364,7 @@ class MetaAnnDataModule:
 
         else:
             raise ValueError(f"Invalid stage: {stage}")
+
 
     @property
     def train_dataloader(self):
@@ -400,6 +424,6 @@ class MetaAnnDataModule:
             f"MetaAnnDataModule(num_species={len(self.adatas)}, batch_size={self.batch_size}, "
             f"shuffle={self.shuffle}, max_stochastic_shift={self.max_stochastic_shift}, "
             f"random_reverse_complement={self.random_reverse_complement}, "
-            f"always_reverse_complement={self.always_reverse_complement}, in_memory={self.in_memory}, "
+            f"in_memory={self.in_memory}, "
             f"deterministic_shift={self.deterministic_shift}, epoch_size={self.epoch_size})"
         )

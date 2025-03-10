@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
 import xarray as xr
+from .crandata import LazyData
 
 try:
     import sparse
@@ -143,6 +144,56 @@ class NonShuffleMetaSampler(Sampler):
     def __len__(self):
         return len(self.nonzero_global_indices)
 
+class GroupedChunkMetaSampler(Sampler):
+    """
+    Sampler for a MetaAnnDataset that, for each sample in an epoch, first chooses one dataset
+    (i.e. one file) with probability proportional to its total unnormalized probability,
+    then selects one chunk within that file with probability proportional to the sum of probabilities
+    in that chunk, and finally samples a local index within that chunk according to its probability.
+    
+    This approach ensures that in one batch you can load from a single file and a single chunk,
+    reducing I/O overhead while still preserving some mixing across conditions.
+    """
+    def __init__(self, meta_dataset: MetaAnnDataset, epoch_size: int = 100_000):
+        super().__init__(data_source=meta_dataset)
+        self.meta_dataset = meta_dataset
+        self.epoch_size = epoch_size
+        # meta_dataset.file_probs should have been computed as shown above.
+        self.file_probs = meta_dataset.file_probs
+
+    def __iter__(self):
+        for _ in range(self.epoch_size):
+            # Sample one dataset (file) based on its total probability
+            ds_idx = np.random.choice(len(self.meta_dataset.datasets), p=self.file_probs)
+            dataset = self.meta_dataset.datasets[ds_idx]
+            
+            # Now get the list of chunks available in this dataset and compute chunk probabilities
+            chunk_keys = list(dataset.chunk_weights.keys())
+            chunk_weights = np.array([dataset.chunk_weights[ch] for ch in chunk_keys])
+            if chunk_weights.sum() <= 0:
+                # If by chance no probability remains, sample uniformly from chunks
+                chunk_probs = np.ones_like(chunk_weights) / len(chunk_weights)
+            else:
+                chunk_probs = chunk_weights / chunk_weights.sum()
+            
+            # Sample one chunk from the chosen dataset
+            chosen_chunk = np.random.choice(chunk_keys, p=chunk_probs)
+            
+            # Within the chosen chunk, get the local indices and their associated probabilities
+            local_indices = dataset.chunk_groups[chosen_chunk]
+            local_probs = dataset.augmented_probs[local_indices]
+            if local_probs.sum() <= 0:
+                local_probs = np.ones_like(local_probs)
+            else:
+                local_probs = local_probs / local_probs.sum()
+            chosen_local_idx = np.random.choice(local_indices, p=local_probs)
+            
+            # Yield the global index as a tuple (dataset index, local index)
+            yield (ds_idx, chosen_local_idx)
+
+    def __len__(self):
+        return self.epoch_size
+
 
 class AnnDataLoader:
     """
@@ -201,6 +252,8 @@ class AnnDataLoader:
         if isinstance(dataset, MetaAnnDataset):
             if self.stage == "train":
                 self.sampler = MetaSampler(dataset, epoch_size=self.epoch_size)
+                # self.sampler = GroupedChunkMetaSampler(dataset, epoch_size=self.epoch_size)
+                
             else:
                 self.sampler = NonShuffleMetaSampler(dataset, sort=True)
         else:
@@ -215,42 +268,96 @@ class AnnDataLoader:
                 if self.shuffle and hasattr(self.dataset, "shuffle"):
                     self.dataset.shuffle = True
 
-    def _collate_fn(self, batch):
-        x = defaultdict(list)
-        # First, convert each sample’s keys to dense tensors.
-        for sample_dict in batch:
-            for key, val in sample_dict.items():
-                if isinstance(val, xr.DataArray):
-                    try:
-                        underlying = val.variable.data
-                    except Exception:
-                        underlying = None
-                    if sparse is not None and underlying is not None and isinstance(underlying, sparse.COO):
-                        # Manually densify if underlying data is sparse.
-                        arr = np.asarray(underlying.todense())
-                    else:
-                        arr = np.asarray(val)
-                else:
-                    arr = np.asarray(val)
-                # If the resulting array is scalar, expand dims.
-                if arr.ndim == 0:
-                    arr = np.expand_dims(arr, 0)
-                x[key].append(torch.as_tensor(arr, dtype=torch.float32))
-        # Now stack the list of tensors along a new batch dimension.
-        # We assume each sample's arrays are of shape [n_obs, ...]. After stacking,
-        # each key becomes a tensor of shape [n_obs, batch, ...].
-        for key in x:
-            x[key] = torch.stack(x[key], dim=1)
-            # Now optionally, shuffle the obs dimension (axis 0) consistently across all keys.
-            if self.shuffle_obs:
-                perm = torch.randperm(x[key].shape[0])
-                x[key] = x[key][perm]
-            if self.device is not None:
-                x[key] = x[key].to(self.device)
-        return x
+    # def _collate_fn(self, batch):
+    #     x = defaultdict(list)
+    #     # First, convert each sample’s keys to dense tensors.
+    #     for sample_dict in batch:
+    #         for key, val in sample_dict.items():
+    #             if isinstance(val, xr.DataArray):
+    #                 try:
+    #                     underlying = val.variable.data
+    #                 except Exception:
+    #                     underlying = None
+    #                 if sparse is not None and underlying is not None and isinstance(underlying, sparse.COO):
+    #                     # Manually densify if underlying data is sparse.
+    #                     arr = np.asarray(underlying.todense())
+    #                 else:
+    #                     arr = np.asarray(val)
+    #             else:
+    #                 arr = np.asarray(val)
+    #             # If the resulting array is scalar, expand dims.
+    #             if arr.ndim == 0:
+    #                 arr = np.expand_dims(arr, 0)
+    #             x[key].append(torch.as_tensor(arr, dtype=torch.float32))
+    #     # Now stack the list of tensors along a new batch dimension.
+    #     # We assume each sample's arrays are of shape [n_obs, ...]. After stacking,
+    #     # each key becomes a tensor of shape [n_obs, batch, ...].
+    #     for key in x:
+    #         x[key] = torch.stack(x[key], dim=1)
+    #         # Now optionally, shuffle the obs dimension (axis 0) consistently across all keys.
+    #         if self.shuffle_obs:
+    #             perm = torch.randperm(x[key].shape[0])
+    #             x[key] = x[key][perm]
+    #         if self.device is not None:
+    #             x[key] = x[key].to(self.device)
+    #     return x
 
+    def batch_collate_fn(self, batch):
+        """
+        Collate function that groups LazyData objects by their underlying lazy_obj so that 
+        the file is opened only once per group. For each retrieved item, if the number of observations 
+        is less than len(global_obs), reindex using reindex_obs_array (which pads missing obs with NaN).
+        Non-lazy items are collated in the standard way.
+        Finally, for each key that has an observation dimension (assumed to be axis 0), the obs dimension
+        is optionally shuffled.
+        """
+        collated = {}
+        for key in batch[0]:
+            # If every sample's value for this key is a LazyData instance, process it in groups.
+            if all(isinstance(sample[key], LazyData) for sample in batch):
+                groups = {}
+                for i, sample in enumerate(batch):
+                    ld = sample[key]
+                    group_id = id(ld.lazy_obj)
+                    groups.setdefault(group_id, []).append((i, ld.key, ld))
+                results = [None] * len(batch)
+                # Process each group.
+                for group in groups.values():
+                    lazy_obj = group[0][2].lazy_obj
+                    # Collect keys for the group.
+                    keys = [item[1] for item in group]
+                    # Open the file once and retrieve all items.
+                    with h5py.File(lazy_obj.filename, "r") as f:
+                        dset = f[lazy_obj.dataset_name]
+                        group_data = [dset[k] for k in keys]
+                    # For each retrieved array, reindex if necessary.
+                    for j, (i, _, ld) in enumerate(group):
+                        data_item = group_data[j]
+                        if ld.global_obs is not None and data_item.shape[0] < len(ld.global_obs):
+                            data_item = reindex_obs_array(data_item, ld.local_obs, ld.global_obs)
+                        results[i] = data_item
+                # Stack the list of results into a tensor along a new batch dimension.
+                collated_value = torch.stack([torch.as_tensor(r, dtype=torch.float32) for r in results], dim=1)
+            else:
+                # Standard collation for non-lazy items.
+                tensors = []
+                for sample in batch:
+                    val = sample[key]
+                    arr = np.array(val)
+                    if arr.ndim == 0:
+                        arr = np.expand_dims(arr, 0)
+                    tensors.append(torch.as_tensor(arr, dtype=torch.float32))
+                collated_value = torch.stack(tensors, dim=1)
+            # If shuffle_obs is enabled and the tensor has an observation dimension, shuffle it.
+            if self.shuffle_obs and collated_value.ndim > 0:
+                perm = torch.randperm(collated_value.shape[0])
+                collated_value = collated_value[perm]
+            if self.device is not None:
+                collated_value = collated_value.to(self.device)
+            collated[key] = collated_value
+        return collated
+    
     def _create_dataset(self):
-        # ... (same as before, using self.sampler if available) ...
         from torch.utils.data import DataLoader
         if os.environ.get("KERAS_BACKEND", "") == "torch":
             if self.sampler is not None:
@@ -260,7 +367,7 @@ class AnnDataLoader:
                     sampler=self.sampler,
                     drop_last=self.drop_remainder,
                     num_workers=0,
-                    collate_fn=self._collate_fn,
+                    collate_fn=self.batch_collate_fn,
                 )
             else:
                 return DataLoader(
@@ -269,7 +376,7 @@ class AnnDataLoader:
                     shuffle=self.shuffle,
                     drop_last=self.drop_remainder,
                     num_workers=0,
-                    collate_fn=self._collate_fn,
+                    collate_fn=self.batch_collate_fn,
                 )
         elif os.environ.get("KERAS_BACKEND", "") == "tensorflow": #Someone who knows tf will have to deal with this
             ds = tf.data.Dataset.from_generator(

@@ -10,7 +10,7 @@ import xarray as xr
 from crandata.chrom_io import import_bigwigs, add_contact_strengths_to_varp
 from crandata._genome import Genome
 from crandata._anndatamodule import MetaAnnDataModule
-from crandata.yanndata import CrAnData
+from crandata.crandata import CrAnData
 
 from crandata.chrom_io import import_bigwigs
 from crandata._anndatamodule import MetaAnnDataModule
@@ -224,6 +224,67 @@ def test_meta_ann_data_module(temp_setup, tmp_path: Path):
         assert key in batch
         # Assuming batch dimension is the second axis (batch_size == 3)
         assert batch[key].shape[1] == 3
+
+
+def test_n_bins_extraction(tmp_path: Path):
+    # Create a chromsizes file with one chromosome.
+    chromsizes_file = tmp_path / "chrom.sizes"
+    chromsizes_file.write_text("chr1\t1000\n")
+    
+    # Create a consensus BED file with one region: chr1 100 150 (width = 50).
+    consensus = pd.DataFrame({
+        0: ["chr1"],
+        1: [100],
+        2: [150]
+    })
+    # Also create a 'region' column as used by import_bigwigs.
+    consensus["region"] = consensus[0] + ":" + consensus[1].astype(str) + "-" + consensus[2].astype(str)
+    consensus_file = tmp_path / "consensus.bed"
+    consensus_file.write_text(consensus.to_csv(sep="\t", header=False, index=False))
+    
+    # Create a dummy BigWig file using pybigtools.
+    bigwigs_dir = tmp_path / "bigwigs"
+    bigwigs_dir.mkdir()
+    bigwig_file = bigwigs_dir / "test.bw"
+    import pybigtools
+    bw = pybigtools.open(str(bigwig_file), mode="w")
+    # Write a constant signal (5.0) over chr1 (length 1000)
+    bw.write(chroms={"chr1": 1000}, vals=[("chr1", 0, 1000, 5.0)])
+    bw.close()
+    
+    # Define an HDF5 backing path.
+    backed_path = tmp_path / "data.h5"
+    
+    # Set target_region_width = 50, target mode = "raw" (which uses bw.values and the bins parameter)
+    target_region_width = 50
+    target = "raw"
+    
+    # --- Test with n_bins set to 10 ---
+    adata_bins = import_bigwigs(
+        bigwigs_folder=bigwigs_dir,
+        regions_file=consensus_file,
+        backed_path=str(backed_path),
+        target_region_width=target_region_width,
+        target=target,
+        chromsizes_file=str(chromsizes_file),
+        n_bins=10
+    )
+    # Check that X has shape (n_obs, n_var, 10)
+    assert adata_bins.X.shape[2] == 10, f"Expected 10 bins, got {adata_bins.X.shape[2]}"
+    
+    # --- Test with n_bins as None ---
+    backed_path2 = tmp_path / "data2.h5"
+    adata_full = import_bigwigs(
+        bigwigs_folder=bigwigs_dir,
+        regions_file=consensus_file,
+        backed_path=str(backed_path2),
+        target_region_width=target_region_width,
+        target=target,
+        chromsizes_file=str(chromsizes_file),
+        n_bins=None
+    )
+    # Without binning, the extracted sequence length should equal the target_region_width.
+    assert adata_full.X.shape[2] == target_region_width, f"Expected {target_region_width} values, got {adata_full.X.shape[2]}"
 
 
 def test_meta_module_two_genomes(tmp_path: Path):

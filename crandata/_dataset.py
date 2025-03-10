@@ -9,13 +9,15 @@ import re
 import numpy as np
 import pandas as pd
 import xarray as xr
-from .yanndata import CrAnData
+from .crandata import CrAnData
 from loguru import logger
 from scipy.sparse import spmatrix
 from tqdm import tqdm
+from .crandata import LazyData
 
 from ._genome import Genome
 from .utils import one_hot_encode_sequence
+
 
 def _flip_region_strand(region: str) -> str:
     strand_reverser = {"+": "-", "-": "+"}
@@ -253,51 +255,67 @@ class AnnDataset(BaseClass):
             var_idx = self.index_map[original_region]
             self.augmented_probs[i] = probs[var_idx]
 
-    def _get_data_array(self, source_str: str, varname: str, shift: int = 0):
-        var_idx = self.index_map[varname]
-        if source_str == "X":
-            arr = self.adata.X[:, var_idx].toarray().flatten() if self.compressed else self.adata.X[:, var_idx]
-            return arr
-        elif source_str.startswith("layers/"):
-            key = source_str.split("/", 1)[1]
-            start_idx = self.max_stochastic_shift + shift
-            end_idx = start_idx + self.region_width
-            arr = self.adata.layers[key][self.meta_obs_names, var_idx][..., start_idx:end_idx]
-            return arr
-        elif source_str.startswith("varp/"):
-            key = source_str.split("/", 1)[1]
-            return self.adata.varp[key][var_idx]
-        else:
-            raise ValueError(f"Data source '{source_str}' is not indexable by variable.")
-
     def __getitem__(self, idx: int) -> dict:
         if not isinstance(idx, int):
             raise IndexError("Index must be an integer.")
         augmented_index = self.index_manager.augmented_indices[idx]
         original_index = self.index_manager.augmented_indices_map[augmented_index]
-        shift = np.random.randint(-self.max_stochastic_shift, self.max_stochastic_shift + 1) if self.max_stochastic_shift > 0 else 0
+        shift = (np.random.randint(-self.max_stochastic_shift, self.max_stochastic_shift + 1)
+                 if self.max_stochastic_shift > 0 else 0)
         x_seq = self.sequence_loader.get_sequence(augmented_index, stranded=True, shift=shift)
         if self.random_reverse_complement and np.random.rand() < 0.5:
             x_seq = self.sequence_loader._reverse_complement(x_seq)
         seq_onehot = one_hot_encode_sequence(x_seq, expand_dim=False)
         item = {"sequence": seq_onehot}
-        # For data sources that index by variable:
         for key, source_str in self.data_sources.items():
             if key == "sequence":
                 continue
             if source_str in ["X"] or source_str.startswith("layers/") or source_str.startswith("varp/"):
-                arr = self._get_data_array(source_str, original_index, shift=shift)
-            # For observation-level data, attach entire columns/arrays
+                # Return a LazyData proxy
+                item[key] = self._get_data_array(source_str, original_index, shift=shift)
             elif source_str.startswith("obs/"):
                 col = source_str.split("/", 1)[1]
-                arr = self.adata.obs[col].values
+                item[key] = self.adata.obs[col].values
             elif source_str.startswith("obsm/"):
                 key_name = source_str.split("/", 1)[1]
-                arr = self.adata.obsm[key_name].values
+                item[key] = self.adata.obsm[key_name].values
             else:
                 raise ValueError(f"Unknown data source prefix in '{source_str}'")
-            item[key] = arr
         return item
+
+    def _get_data_array(self, source_str: str, varname: str, shift: int = 0):
+        var_idx = self.index_map[varname]
+        if source_str == "X":
+            lazy_obj = self.adata.X.data  # LazyH5Array instance
+            key = (slice(None), var_idx)
+            return LazyData(lazy_obj, key, 
+                            local_obs=np.array(self.adata.obs.index),
+                            global_obs=np.array(self.adata.meta_obs_names))
+        elif source_str.startswith("layers/"):
+            key = source_str.split("/", 1)[1]
+            start_idx = self.max_stochastic_shift + shift
+            end_idx = start_idx + self.region_width
+            lazy_obj = (self.adata.layers[key].data 
+                        if hasattr(self.adata.layers[key], "data") else None)
+            if lazy_obj is not None:
+                key_tuple = (self.meta_obs_names, var_idx, slice(start_idx, end_idx))
+                return LazyData(lazy_obj, key_tuple,
+                                local_obs=np.array(self.adata.obs.index),
+                                global_obs=np.array(self.adata.meta_obs_names))
+            else:
+                arr = self.adata.layers[key][self.meta_obs_names, var_idx][..., start_idx:end_idx]
+                return arr
+        elif source_str.startswith("varp/"):
+            key = source_str.split("/", 1)[1]
+            lazy_obj = (self.adata.varp[key].data 
+                        if hasattr(self.adata.varp[key], "data") else None)
+            if lazy_obj is not None:
+                key_tuple = (var_idx,)
+                return LazyData(lazy_obj, key_tuple)
+            else:
+                return self.adata.varp[key][var_idx]
+        else:
+            raise ValueError(f"Data source '{source_str}' is not indexable by variable.")
 
     def __call__(self):
         for i in range(len(self)):
