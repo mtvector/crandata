@@ -279,7 +279,7 @@ class AnnDataLoader:
         obs dimension across all keys.
         """
         collated = {}
-        
+        print('batch len',len(batch))
         # If we're dealing with a MetaAnnDataset, use the meta_obs_names from the first dataset.
         global_obs = None
         local_obs = None
@@ -346,6 +346,8 @@ class AnnDataLoader:
                 for key in collated:
                     if collated[key].ndim > 0 and collated[key].shape[0] == obs_dim:
                         collated[key] = collated[key][perm]
+                    if collated[key].shape[1] == len(batch) and collated[key].shape[0] != len(batch):
+                        collated[key] = collated[key].permute((1, 0) + tuple(range(2, collated[key].ndim)))
         if self.device is not None:
             for key in collated:
                 collated[key] = collated[key].to(self.device)

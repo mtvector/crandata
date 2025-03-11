@@ -11,7 +11,11 @@ The problem we were previously having is that reading from the disk individually
 
 
 
+Write generalized version of the CrAnData, module, dataset and dataloader where every array has its dimensions named and we don't rely on forcing the [obs,var,...] dimensions. Instead of having stereotyped ordering so we know which is obs, in AnnDataModule/MetaAnnDataModule, specify what the global order of all the dimensions should be, and order the dimensions of the arrays to follow this convention (and leave unnamed dimensions in the same order at the end). With this, we should be able to choose which which dimension will be the batch dimension, and sample the first occurance of that dimension in each batch. Then you should also be able to specify which dimensions to shuffle, and apply the same shuffle order to all the arrays on that dimension.
 
-Write general version where every array has its dimensions named. Instead of having stereotyped ordering so we know which is obs, in AnnDataModule/MetaAnnDataModule, specify what the global order of all the dimensions should be, and order the dimensions of the arrays to follow this convention (and leave unnamed dimensions in the same order at the end). With this, we should be able to choose which which dimension will be the batch dimension, and sample the first occurance of that dimension in each batch. Then you should also be able to specify which dimensions to shuffle, and apply the same shuffle order to all the arrays on that dimension.
+We should rely on the same types of utilities I have so far so that we lazy load our arrays from the disk by their file and chunk, fill missing indices with nans (on dimensions of variable size, like obs here), collate, shuffle and convert to tensors on device. This should make it easy to also return tensors of customized axes ordering, where we'll usually want the batch dimension first for broadcasting purposes and can align other indices after that.
 
-We should rely on the 
+Ideally, by writing this code to be maximally general, it will be more succinct and elegant.
+
+
+Make sequence loading more efficient by storing it within the h5ad as int8, apply a simple reindexing of onehot columns 
