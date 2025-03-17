@@ -1,9 +1,3 @@
-"""_dataset.py – Dataset class for combining genome files and CrAnData objects
-using a unified data_sources interface.
-"""
-
-from __future__ import annotations
-
 import os
 import re
 import numpy as np
@@ -13,16 +7,17 @@ from .crandata import CrAnData
 from loguru import logger
 from scipy.sparse import spmatrix
 from tqdm import tqdm
-from .crandata import LazyData
 from ._genome import Genome
 from .utils import one_hot_encode_sequence
-
 
 def _flip_region_strand(region: str) -> str:
     strand_reverser = {"+": "-", "-": "+"}
     return region[:-1] + strand_reverser[region[-1]]
 
 def _check_strandedness(region: str) -> bool:
+    # Ensure region is a string (decode bytes if necessary)
+    if isinstance(region, bytes):
+        region = region.decode("utf-8")
     if re.fullmatch(r".+:\d+-\d+:[-+]", region):
         return True
     elif re.fullmatch(r".+:\d+-\d+", region):
@@ -60,8 +55,12 @@ class SequenceLoader:
         self.max_stochastic_shift = max_stochastic_shift
         self.sequences = {}
         self.complement = str.maketrans("ACGT", "TGCA")
-        self.regions = regions
-        if self.in_memory:
+        # Ensure regions are strings (decode bytes if necessary)
+        if regions is not None:
+            self.regions = [r.decode("utf-8") if isinstance(r, bytes) else r for r in regions]
+        else:
+            self.regions = None
+        if self.in_memory and self.regions is not None:
             self._load_sequences_into_memory(self.regions)
 
     def _load_sequences_into_memory(self, regions: list[str]):
@@ -85,13 +84,13 @@ class SequenceLoader:
         if self.chromsizes and chrom in self.chromsizes:
             chrom_size = self.chromsizes[chrom]
             if extended_end > chrom_size:
-                extended_start = chrom_size - (end - start + self.max_stochastic_shift * 2)
                 extended_end = chrom_size
+                extended_start = max(0, extended_end - (end - start + self.max_stochastic_shift * 2))
         seq = self.genome.fetch(chrom, extended_start, extended_end).upper()
         if strand == "-":
             seq = self._reverse_complement(seq)
         return seq
-
+        
     def _reverse_complement(self, sequence: str) -> str:
         return sequence.translate(self.complement)[::-1]
 
@@ -124,6 +123,9 @@ class IndexManager:
         augmented_indices = []
         augmented_indices_map = {}
         for region in indices:
+            # Ensure region is a string
+            if isinstance(region, bytes):
+                region = region.decode("utf-8")
             stranded_region = region if _check_strandedness(region) else f"{region}:+"
             if self.deterministic_shift:
                 shifted_regions = _deterministic_shift_region(stranded_region)
@@ -198,7 +200,11 @@ class AnnDataset(BaseClass):
             extra = arr.ndim - 2
             dims = ["obs", "var"] + [f"dim_{i}" for i in range(extra)]
             self.adata.X = xr.DataArray(arr, dims=dims)
+        # If global_axis_order is empty, set it to the dims of X.
+        if not self.adata.global_axis_order:
+            self.adata.global_axis_order = list(self.adata.X.dims)
         n_obs, n_var = self.adata.X.sizes["obs"], self.adata.X.sizes["var"]
+        self.genome = genome
 
         # Validate obs and var consistency
         if self.adata.obs is None:
@@ -213,12 +219,17 @@ class AnnDataset(BaseClass):
         self.data_sources = data_sources
 
         self.compressed = isinstance(self.adata.X, spmatrix)
-        self.indices = list(self.adata.var_names)
+        # Use the index from the var DataFrame directly.
+        chrom = list(self.genome.chrom_sizes.keys())[0]
+        chrom_length = self.genome.chrom_sizes[chrom]
+        self.indices = [f"{chrom}:0-{chrom_length}:+"] * len(self.adata.obs)
+
         self.index_map = {index: i for i, index in enumerate(self.indices)}
         self.num_outputs = self.adata.X.shape[0]
         self.random_reverse_complement = random_reverse_complement
         self.max_stochastic_shift = max_stochastic_shift
-        self.meta_obs_names = np.array(self.adata.obs_names)
+        # Use the obs DataFrame index for meta observations.
+        self.meta_obs_names = np.array(self.adata.obs.index)
         self.shuffle = False
 
         self.sequence_loader = SequenceLoader(
@@ -270,7 +281,6 @@ class AnnDataset(BaseClass):
             if key == "sequence":
                 continue
             if source_str in ["X"] or source_str.startswith("layers/") or source_str.startswith("varp/"):
-                # Return a LazyData proxy
                 item[key] = self._get_data_array(source_str, original_index, shift=shift)
             elif source_str.startswith("obs/"):
                 col = source_str.split("/", 1)[1]
@@ -285,36 +295,15 @@ class AnnDataset(BaseClass):
     def _get_data_array(self, source_str: str, varname: str, shift: int = 0):
         var_idx = self.index_map[varname]
         if source_str == "X":
-            lazy_obj = self.adata.X.data  # Might be LazyH5Array OR already an array.
-            # Only wrap in LazyData if the underlying object is truly lazy.
-            if hasattr(lazy_obj, "filename"):
-                key = (slice(None), var_idx)
-                return LazyData(lazy_obj, key,
-                                local_obs=np.array(self.adata.obs.index),
-                                global_obs=np.array(self.adata.meta_obs_names))
-            else:
-                # If it's already an array, return the appropriate slice.
-                return self.adata.X[:, var_idx]
+            # Directly index the xarray object.
+            return self.adata.X[var_idx,:]
         elif source_str.startswith("layers/"):
             key_name = source_str.split("/", 1)[1]
             start_idx = self.max_stochastic_shift + shift
             end_idx = start_idx + self.region_width
-            if hasattr(self.adata.layers[key_name], "data"):
-                lazy_obj = self.adata.layers[key_name].data
-                if hasattr(lazy_obj, "filename"):
-                    key_tuple = (self.meta_obs_names, var_idx, slice(start_idx, end_idx))
-                    return LazyData(lazy_obj, key_tuple,
-                                    local_obs=np.array(self.adata.obs.index),
-                                    global_obs=np.array(self.adata.meta_obs_names))
-            # Otherwise, fall back to loading immediately.
-            return self.adata.layers[key_name][self.meta_obs_names, var_idx][..., start_idx:end_idx]
+            return self.adata.layers[key_name][..., start_idx:end_idx]
         elif source_str.startswith("varp/"):
             key_name = source_str.split("/", 1)[1]
-            if hasattr(self.adata.varp[key_name], "data"):
-                lazy_obj = self.adata.varp[key_name].data
-                if hasattr(lazy_obj, "filename"):
-                    key_tuple = (var_idx,)
-                    return LazyData(lazy_obj, key_tuple)
             return self.adata.varp[key_name][var_idx]
         else:
             raise ValueError(f"Data source '{source_str}' is not indexable by variable.")

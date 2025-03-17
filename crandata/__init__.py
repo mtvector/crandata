@@ -1,3 +1,4 @@
+from . import crandata
 from . import crandata, chrom_io
 from .crandata import CrAnData
 from ._anndatamodule import AnnDataModule, MetaAnnDataModule

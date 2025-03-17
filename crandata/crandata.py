@@ -1,8 +1,10 @@
-import h5py
+import os
+import json
+import tempfile
 import numpy as np
 import xarray as xr
-import pandas as pd
-# from anndata import AnnData
+import h5py
+import copy
 
 try:
     import sparse  # for sparse multidimensional arrays
@@ -13,12 +15,22 @@ except ImportError:
 # -------------------------
 # Sparse helpers
 # -------------------------
+def ensure_row_major(sparse_array: sparse.COO) -> sparse.COO:
+    """
+    Ensure the sparse.COO array is in row-major order along its first axis.
+    """
+    if not np.all(np.diff(sparse_array.coords[0]) >= 0):
+        order = np.argsort(sparse_array.coords[0])
+        new_coords = sparse_array.coords[:, order]
+        new_data = sparse_array.data[order]
+        return sparse.COO(new_coords, new_data, shape=sparse_array.shape)
+    return sparse_array
+
 def write_sparse_array(f, group_name: str, sparse_array):
     """
-    Write a sparse.COO array to an HDF5 group.
-    Stores three datasets: "data", "coords", and "shape",
-    and sets attributes "sparse" and "dtype".
+    Write a sparse.COO array to an HDF5 group after ensuring row-major order.
     """
+    sparse_array = ensure_row_major(sparse_array)
     grp = f.create_group(group_name)
     grp.create_dataset("data", data=sparse_array.data, compression="gzip")
     grp.create_dataset("coords", data=sparse_array.coords, compression="gzip")
@@ -27,9 +39,6 @@ def write_sparse_array(f, group_name: str, sparse_array):
     grp.attrs["dtype"] = str(sparse_array.dtype)
 
 def read_sparse_array(f, group_name: str):
-    """
-    Read a sparse.COO array from an HDF5 group.
-    """
     grp = f[group_name]
     data = grp["data"][()]
     coords = grp["coords"][()]
@@ -37,201 +46,94 @@ def read_sparse_array(f, group_name: str):
     return sparse.COO(coords, data, shape=shape)
 
 def _to_dataarray(X, dim_names):
-    if not isinstance(X, xr.DataArray):
-        X = np.asarray(X)
-        X = xr.DataArray(X, dims=dim_names)
-    return X
+    if isinstance(X, xr.DataArray):
+        return X
+    if sparse is not None and isinstance(X, sparse.COO):
+        return xr.DataArray(X, dims=dim_names)
+    X_arr = np.asarray(X)
+    return xr.DataArray(X_arr, dims=dim_names)
 
 # -------------------------
-# Lazy loading helper for backed arrays
+# Generic save/load helpers
 # -------------------------
-def reindex_obs_array(array: np.ndarray, local_obs: np.ndarray, global_obs: np.ndarray) -> np.ndarray:
-    """
-    Given a NumPy array whose first dimension corresponds to local observations,
-    create a new array with first dimension equal to len(global_obs).
-    For observations in local_obs, copy the values; for missing ones, fill with NaN.
-    """
-    new_shape = (len(global_obs),) + array.shape[1:]
-    new_array = np.full(new_shape, np.nan, dtype=array.dtype)
-    for i, obs in enumerate(local_obs):
-        idx = np.where(global_obs == obs)[0]
-        if idx.size:
-            new_array[idx[0]] = array[i]
-    return new_array
+def _decode_if_needed(arr):
+    if isinstance(arr, np.ndarray) and arr.dtype.kind in ('S', 'O'):
+        # Decode each element if it is a bytes object.
+        return np.array([x.decode('utf-8') if isinstance(x, bytes) else x for x in arr])
+    return arr
 
-class LazyH5Array:
-    """
-    A simple lazy loader that wraps an HDF5 dataset.
-    When indexed, it reopens the file, retrieves the requested slice, then closes the file.
-    """
-    def __init__(self, filename: str, dataset_name: str, shape, dtype, chunks=None):
-        self.filename = filename
-        self.dataset_name = dataset_name
-        self.shape = shape
-        self.dtype = dtype
-        self.chunks = chunks
-
-    def __getitem__(self, key):#or keys
-        with h5py.File(self.filename, "r") as f:
-            data = f[self.dataset_name][key]
-        return data
-
-    def __array__(self):
-        return np.array(self[:])
-
-class LazyData:
-    def __init__(self, lazy_obj, key, local_obs=None, global_obs=None):
-        self.lazy_obj = lazy_obj
-        self.key = key  # key is a slice or list of indices
-        self.local_obs = local_obs
-        self.global_obs = global_obs
-
-    def __array__(self, dtype=None):
-        data = self.lazy_obj.__getitem__(self.key)
-        # If local_obs and global_obs are provided and the number of rows is less than expected,
-        # reindex to pad missing observations.
-        if self.local_obs is not None and self.global_obs is not None:
-            if data.shape[0] < len(self.global_obs):
-                data = reindex_obs_array(data, self.local_obs, self.global_obs)
-        if dtype is not None:
-            return np.array(data, dtype=dtype)
-        return np.array(data)
-
-    def __getitem__(self, subkey):
-        # For further slicing, combine the keys (this is a simplified example).
-        new_key = (self.key, subkey)
-        return LazyData(self.lazy_obj, new_key, self.local_obs, self.global_obs)
-
-# -------------------------
-# Helpers for saving/loading xarray DataArrays
-# -------------------------
-def _save_xarray(f, name: str, xarr: xr.DataArray):
-    """
-    Save an xarray DataArray to an HDF5 dataset.
-    Uses sparse routines if the underlying data is sparse.
-    This version saves only the data and the dimension names,
-    skipping storage of large coordinate arrays.
-    """
+def _save_xarray(f, name: str, xarr: xr.DataArray, chunk_sizes: dict[str, int] | None = None):
+    if chunk_sizes is not None:
+        cs = tuple(
+            min(chunk_sizes.get(dim, xarr.sizes[dim]), xarr.sizes[dim])
+            for dim in xarr.dims
+        )
+    else:
+        cs = None
     try:
         underlying = xarr.variable.data
     except Exception:
         underlying = None
     if sparse is not None and underlying is not None and isinstance(underlying, sparse.COO):
+        underlying = ensure_row_major(underlying)
         write_sparse_array(f, name, underlying)
     else:
-        f.create_dataset(name, data=xarr.values, compression="gzip")
+        # If the data is a Unicode string array, convert it to a list so h5py can handle it.
+        if xarr.values.dtype.kind == 'U':
+            data_to_save = xarr.values.tolist()
+            str_dtype = h5py.string_dtype(encoding='utf-8')
+            f.create_dataset(name, data=data_to_save, dtype=str_dtype, chunks=cs, compression="gzip")
+        else:
+            f.create_dataset(name, data=xarr.values, chunks=cs, compression="gzip")
     ds = f[name]
-    # Save only the dimension names (as a comma‐separated string)
     ds.attrs["dims"] = ",".join(xarr.dims)
-    # Do not store the coordinate arrays.
 
 def _load_xarray(f, name: str, backed: bool) -> xr.DataArray:
-    """
-    Load an xarray DataArray from an HDF5 dataset.
-    This version does not attempt to load coordinate arrays from the file.
-    Instead, it passes coords=None so that xarray will generate default
-    coordinates. These are later overwritten for the obs and var dimensions.
-    """
     dset = f[name]
     dims = dset.attrs["dims"]
     if isinstance(dims, bytes):
         dims = dims.decode("utf-8")
     dims = dims.split(",")
-    # Ignore any stored coordinate arrays; let xarray build defaults.
     if backed:
         lazy_obj = LazyH5Array(f.filename, name, shape=dset.shape, dtype=dset.dtype,
                                 chunks=getattr(dset, "chunks", None))
-        xarr = xr.DataArray(lazy_obj, dims=dims, coords=None)
+        xarr = xr.DataArray(lazy_obj, dims=dims)
         xarr.attrs["_lazy_obj"] = lazy_obj
         return xarr
     else:
         data = dset[()]
-        return xr.DataArray(data, dims=dims, coords=None)
+        return xr.DataArray(data, dims=dims)
 
-# -------------------------
-# Helpers for saving/loading DataFrames
-# -------------------------
-def _save_dataframe(f, name: str, df: pd.DataFrame):
-    grp = f.create_group(name)
-    # Save index as string
-    index_data = np.array(df.index.astype(str), dtype="S")
-    grp.create_dataset("index", data=index_data, compression="gzip")
-    # Store the index name (if any) as an attribute
-    if df.index.name is not None:
-        grp.attrs["index_name"] = df.index.name.encode("utf-8")
-    else:
-        grp.attrs["index_name"] = b""
-    grp.attrs["columns"] = np.array(df.columns.astype(str), dtype="S")
-    for col in df.columns:
-        grp.create_dataset(col, data=df[col].values, compression="gzip")
-
-def _load_dataframe(f, name: str) -> pd.DataFrame:
-    grp = f[name]
-    index_raw = grp["index"][()]
-    # Decode index: if an element is a byte string, decode it
-    index = [x.decode("utf-8") if isinstance(x, bytes) else str(x) for x in index_raw]
-    columns_raw = grp.attrs["columns"]
-    # Decode column names
-    columns = [x.decode("utf-8") if isinstance(x, bytes) else str(x) for x in columns_raw]
-    data = {}
-    for col in columns:
-        col_data = grp[col][()]
-        # If the data array's dtype indicates byte strings, decode each element.
-        if col_data.dtype.kind in ('S', 'O'):
-            decoded = []
-            for item in col_data:
-                if isinstance(item, bytes):
-                    decoded.append(item.decode("utf-8"))
-                else:
-                    decoded.append(item)
-            data[col] = np.array(decoded)
-        else:
-            data[col] = col_data
-    df = pd.DataFrame(data, index=index)
-    # Restore the index name if it was stored.
-    if "index_name" in grp.attrs:
-        index_name = grp.attrs["index_name"]
-        if index_name and isinstance(index_name, bytes):
-            df.index.name = index_name.decode("utf-8")
-        elif index_name:
-            df.index.name = index_name
-    return df
-
-# -------------------------
-# Generic attribute saving/loading helpers
-# -------------------------
 def _save_generic_attr(f, name: str, attr):
-    """
-    Save an attribute to HDF5.
-    - If attr is an xarray DataArray, call _save_xarray.
-    - If attr is a pandas DataFrame, call _save_dataframe.
-    - If attr is a dict (exactly type dict), create a group and recursively save.
-    - Otherwise, convert attr to a numpy array.
-    """
-    if type(attr) is dict:
+    if isinstance(attr, dict):
         grp = f.create_group(name)
         for key, subattr in attr.items():
             _save_generic_attr(grp, key, subattr)
     elif isinstance(attr, xr.DataArray):
         _save_xarray(f, name, attr)
-    elif isinstance(attr, pd.DataFrame):
-        _save_dataframe(f, name, attr)
     else:
         arr = np.asarray(attr)
-        if arr.ndim == 0:
-            f.create_dataset(name, data=arr)
+        if arr.dtype.kind == 'U':  # Unicode strings
+            str_dtype = h5py.string_dtype(encoding='utf-8')
+            if arr.ndim == 0:
+                f.create_dataset(name, data=str(arr), dtype=str_dtype)
+            else:
+                f.create_dataset(name, data=arr.tolist(), dtype=str_dtype, compression="gzip")
         else:
-            f.create_dataset(name, data=arr, compression="gzip")
+            if arr.ndim == 0:
+                f.create_dataset(name, data=arr)
+            else:
+                f.create_dataset(name, data=arr, compression="gzip")
 
 def _load_generic_attr(f, name: str, backed: bool) -> any:
     obj = f[name]
     if isinstance(obj, h5py.Dataset):
         if "dims" in obj.attrs:
-            return _load_xarray(f, name, backed)
+            data = _load_xarray(f, name, backed)
         else:
-            return obj[()]
+            data = obj[()]
+        return _decode_if_needed(data)
     elif isinstance(obj, h5py.Group):
-        # If the group is marked as sparse, load it as an xarray DataArray.
         if "sparse" in obj.attrs and obj.attrs["sparse"]:
             dims = obj.attrs["dims"]
             if isinstance(dims, bytes):
@@ -241,13 +143,9 @@ def _load_generic_attr(f, name: str, backed: bool) -> any:
             for dim in dims:
                 attr_name = f"coord_{dim}"
                 if attr_name in obj.attrs:
-                    coords[dim] = obj.attrs[attr_name]
-            # Load the sparse array from the group
+                    coords[dim] = _decode_if_needed(obj.attrs[attr_name])
             sparse_arr = read_sparse_array(f, f"{name}")
             return xr.DataArray(sparse_arr, dims=dims, coords=coords)
-        # If the group has an attribute "columns", assume it's a DataFrame.
-        elif "columns" in obj.attrs:
-            return _load_dataframe(f, name)
         else:
             out = {}
             for key in obj:
@@ -256,20 +154,38 @@ def _load_generic_attr(f, name: str, backed: bool) -> any:
     else:
         raise ValueError(f"Unsupported HDF5 object type for attribute {name}")
 
-def index_dim(xarr, dim, key):
-    if isinstance(key, (int, slice, np.integer)) or \
-       (isinstance(key, (list, tuple)) and all(isinstance(x, (int, np.integer)) for x in key)):
-        return xarr.isel({dim: key})
-    else:
-        return xarr.sel({dim: key})
+# -------------------------
+# Lazy loading wrappers
+# -------------------------
+class LazyH5Array:
+    """
+    A lazy loader for an HDF5 dataset.
+    Each indexing call opens the file, retrieves the requested slice, then closes the file.
+    """
+    def __init__(self, filename: str, dataset_name: str, shape, dtype, chunks=None):
+        self.filename = filename
+        self.dataset_name = dataset_name
+        self.shape = shape
+        self.dtype = dtype
+        self.chunks = chunks
+
+    def __getitem__(self, key):
+        with h5py.File(self.filename, "r") as f:
+            data = f[self.dataset_name][key]
+        return data
+
+    def __array__(self):
+        return np.array(self[:])
 
 class _XWrapper:
+    """
+    A simple wrapper for an xarray DataArray to allow lazy evaluation.
+    """
     def __init__(self, xarray_obj):
         self._x = xarray_obj
 
     @property
     def data(self):
-        # If a lazy object was stored in the xarray, return that.
         if hasattr(self._x, "attrs") and "_lazy_obj" in self._x.attrs:
             return self._x.attrs["_lazy_obj"]
         return self._x.data
@@ -277,28 +193,12 @@ class _XWrapper:
     def __getitem__(self, key):
         if not isinstance(key, tuple):
             key = (key,)
-        if len(key) < self._x.ndim:
-            key = key + (slice(None),) * (self._x.ndim - len(key))
-        result = self._x
-        for dim, k in zip(self._x.dims, key):
-            result = index_dim(result, dim, k)
-        return result
-
-    def __setitem__(self, key, value):
-        if not isinstance(key, tuple):
-            key = (key,)
-        if len(key) < self._x.ndim:
-            key = key + (slice(None),) * (self._x.ndim - len(key))
-        if all(isinstance(k, (int, slice, np.integer)) for k in key):
-            self._x = self._x.copy(data=self._x.isel(dict(zip(self._x.dims, key))).data)
-        else:
-            result = self._x
-            for dim, k in zip(self._x.dims, key):
-                result = index_dim(result, dim, k)
-            self._x = result
+        key = key + (slice(None),) * (self._x.ndim - len(key))
+        dims = self._x.dims[:len(key)]
+        indexers = {dim: key[i] for i, dim in enumerate(dims)}
+        return self._x.isel(**indexers)
 
     def __array__(self):
-        # Use our custom data property to avoid forcing evaluation.
         return np.asarray(self.data)
 
     def __repr__(self):
@@ -308,222 +208,266 @@ class _XWrapper:
         return getattr(self._x, name)
 
 # -------------------------
-# Standardized CrAnData class
+# The new fully generic CrAnData class with to_memory() and slicing prevention
 # -------------------------
-class CrAnData:#(AnnData):
-    def __init__(self, X, obs=None, var=None, uns=None,
-                 obsm=None, varm=None, layers=None,
-                 varp=None, obsp=None, filename: str = None):
-        # try: #Keep incase we need to pretend we're AnnData
-        #     super().__init__(None)
-        # except Exception:
-        #     print("Bypassing AnnData.__init__")
-        if isinstance(X, xr.DataArray):
-            self._X = X
+class CrAnData:
+    """
+    A fully generic container for genomic data.
+    
+    All properties are stored in an internal dictionary. The primary property is used for slicing.
+    Arrays are expected to have named axes (or names are automatically generated) and coordinate
+    labels may be assigned via the axis_indices dictionary.
+    
+    Slicing applies indices to the leftmost dimensions (with trailing slices added) for every xarray property.
+    Hierarchical keys are allowed and new properties can be added after initialization.
+    
+    If arrays are stored on disk (via to_h5/from_h5), they are loaded lazily.
+    The to_memory() method fully loads all lazy arrays into memory.
+    Further slicing is disallowed on a backed CrAnData that has already been sliced.
+    
+    Default parameters mimic AnnData:
+        CrAnData(X=None, obs=None, var=None, uns=None, obsm=None, varm=None, layers=None)
+    Additional optional parameters:
+        primary_key, global_axis_order, axis_indices, properties_config.
+    """
+    def __init__(self, 
+                 X=None, obs=None, var=None, uns=None, obsm=None, varm=None, layers=None,
+                 primary_key=None, global_axis_order=None, axis_indices=None, properties_config=None,
+                 **kwargs):
+        # Build the dictionary using AnnData-like default keys.
+        self._data = {}
+        self._data["X"] = X
+        self._data["obs"] = obs
+        self._data["var"] = var
+        self._data["uns"] = uns
+        self._data["obsm"] = obsm
+        self._data["varm"] = varm
+        self._data["layers"] = layers
+        self._data.update(kwargs)
+        
+        self.global_axis_order = global_axis_order
+        self.axis_indices = axis_indices if axis_indices is not None else {}
+        # We no longer convert to DataFrame so set convert_to_dataframe to False.
+        self._properties_config = {
+            "obs": {"axis": "obs", "convert_to_dataframe": False, "default": None},
+            "var": {"axis": "var", "convert_to_dataframe": False, "default": None},
+            "uns": {"axis": None, "convert_to_dataframe": False, "default": {}},
+            "obsm": {"axis": None, "convert_to_dataframe": False, "default": {}},
+            "varm": {"axis": None, "convert_to_dataframe": False, "default": {}},
+            "layers": {"axis": None, "convert_to_dataframe": False, "default": {}}
+        }
+        if properties_config is not None:
+            self._properties_config.update(properties_config)
+        
+        self._primary = primary_key if primary_key is not None else "X"
+        
+        for key, val in self._data.items():
+            if isinstance(val, (np.ndarray, list)):
+                nd = np.asarray(val).ndim
+                if self.global_axis_order is not None and len(self.global_axis_order) <= nd:
+                    dims = self.global_axis_order + [f"dim_{i}" for i in range(len(self.global_axis_order), nd)]
+                else:
+                    dims = [f"dim_{i}" for i in range(nd)]
+                arr = _to_dataarray(val, dims)
+                new_coords = {}
+                for d in dims:
+                    if d not in arr.coords and d in self.axis_indices:
+                        new_coords[d] = np.array(self.axis_indices[d])
+                if new_coords:
+                    arr = arr.assign_coords(**new_coords)
+                self._data[key] = arr
+        
+        if self.global_axis_order is not None and isinstance(self._data[self._primary], xr.DataArray):
+            current_dims = list(self._data[self._primary].dims)
+            new_order = [d for d in self.global_axis_order if d in current_dims]
+            remaining = [d for d in current_dims if d not in self.global_axis_order]
+            self._data[self._primary] = self._data[self._primary].transpose(*new_order, *remaining)
+        
+        if "obs" not in self._data:
+            self._data["obs"] = None
+        if "var" not in self._data:
+            self._data["var"] = None
+        
+        self._is_sliced = False
+        self.filename = None
+        
+        for key in self._data.keys():
+            self._create_dynamic_property(key, self._properties_config.get(key, {}).get("convert_to_dataframe", False))
+        
+        if isinstance(self._data[self._primary], xr.DataArray):
+            for d in self._data[self._primary].dims:
+                prop_names = f"{d}_names"
+                def axis_names_getter(self, axis=d):
+                    if axis in self._data[self._primary].coords:
+                        return self._data[self._primary].coords[axis].values
+                    elif axis in self.axis_indices:
+                        return np.array(self.axis_indices[axis])
+                    else:
+                        size = self._data[self._primary].sizes.get(axis, None)
+                        return np.arange(size) if size is not None else None
+                setattr(self.__class__, prop_names, property(axis_names_getter))
+                prop_size = f"n_{d}"
+                def n_axis_getter(self, axis=d):
+                    return self._data[self._primary].sizes.get(axis, None)
+                setattr(self.__class__, prop_size, property(n_axis_getter))
+        
+        self.primary_key = self._primary
+        
+        self._propagate_missing_coordinates()
+
+    def _create_dynamic_property(self, prop_name, convert_to_dataframe: bool):
+        def getter(self):
+            return self._data.get(prop_name, None)
+        def setter(self, value):
+            self._data[prop_name] = value
+        setattr(self.__class__, prop_name, property(getter, setter))
+
+    def _propagate_missing_coordinates(self):
+        """
+        For each axis in global_axis_order, if at least one property has nonempty coordinates,
+        then assign those coordinates to any property that has that axis but is missing coordinates.
+        """
+        if self.global_axis_order is None:
+            return
+        default_coords = {}
+        for axis in self.global_axis_order:
+            for key, val in self._data.items():
+                if isinstance(val, xr.DataArray) and axis in val.coords:
+                    coord = np.asarray(val.coords[axis])
+                    if coord.size > 0:
+                        default_coords[axis] = coord
+                        break
+        for key, val in self._data.items():
+            if isinstance(val, xr.DataArray) and any(ax in val.dims for ax in self.global_axis_order):
+                new_coords = {}
+                for axis in self.global_axis_order:
+                    if axis in val.dims:
+                        if (axis not in val.coords) or (np.asarray(val.coords[axis]).size == 0):
+                            if axis in default_coords:
+                                new_coords[axis] = default_coords[axis]
+                if new_coords:
+                    self._data[key] = val.assign_coords(**new_coords)
+
+    def add_property(self, key, value, dims=None, axis_indices=None, config=None):
+        """
+        Add (or update) a property after initialization.
+        """
+        if isinstance(value, (np.ndarray, list)):
+            nd = np.asarray(value).ndim
+            if dims is None:
+                dims = [f"dim_{i}" for i in range(nd)]
+            arr = _to_dataarray(value, dims)
+            if axis_indices is not None:
+                new_coords = {}
+                for d in dims:
+                    if d not in arr.coords and d in axis_indices:
+                        new_coords[d] = np.array(axis_indices[d])
+                if new_coords:
+                    arr = arr.assign_coords(**new_coords)
+            self._data[key] = arr
         else:
-            arr = np.asarray(X)
-            extra = arr.ndim - 2
-            dims = ["obs", "var"] + [f"dim_{i}" for i in range(extra)]
-            self._X = xr.DataArray(arr, dims=dims)
-        n_obs, n_var = self._X.sizes["obs"], self._X.sizes["var"]
+            self._data[key] = value
+        if config is not None:
+            self._properties_config[key] = config
+        self._create_dynamic_property(key, self._properties_config.get(key, {}).get("convert_to_dataframe", False))
+        self._propagate_missing_coordinates()
 
-        if obs is None:
-            self._obs = pd.DataFrame(index=[str(i) for i in range(n_obs)])
+    @property
+    def primary(self):
+        return _XWrapper(self._data[self._primary])
+
+    @primary.setter
+    def primary(self, value):
+        if isinstance(value, xr.DataArray):
+            self._data[self._primary] = value
         else:
-            self._obs = pd.DataFrame(obs)
-            if len(self._obs) != n_obs:
-                raise ValueError("Length of obs does not match number of observations in X.")
-        if var is None:
-            self._var = pd.DataFrame(index=[str(i) for i in range(n_var)])
-        else:
-            self._var = pd.DataFrame(var)
-            if len(self._var) != n_var:
-                raise ValueError("Length of var does not match number of variables in X.")
-
-        self._X = self._X.assign_coords(obs=("obs", np.array(self._obs.index)),
-                                         var=("var", np.array(self._var.index)))
-        # uns, layers, obsm, varm, varp, and obsp are stored using our generic routines.
-        self.uns = uns if uns is not None else {}
-        self.layers = layers if layers is not None else {}
-        self.obsm = obsm if obsm is not None else {}
-        self.varm = varm if varm is not None else {}
-        self.varp = varp if varp is not None else {}
-        self.obsp = obsp if obsp is not None else None
-        self.filename = filename
-
-    @property
-    def X(self):
-        return _XWrapper(self._X)
-
-    @X.setter
-    def X(self, value):
-        self._X = _to_dataarray(np.asarray(value), self._X.dims)
-        self._X = self._X.assign_coords(obs=("obs", np.array(self._obs.index)),
-                                         var=("var", np.array(self._var.index)))
-
-    @property
-    def obs(self):
-        return self._obs
-
-    @obs.setter
-    def obs(self, value):
-        self._obs = pd.DataFrame(value)
-
-    @property
-    def var(self):
-        return self._var
-
-    @var.setter
-    def var(self, value):
-        self._var = pd.DataFrame(value)
-
-    @property
-    def obsm(self):
-        return self._obsm
-
-    @obsm.setter
-    def obsm(self, value):
-        self._obsm = value
-
-    @property
-    def varm(self):
-        return self._varm
-
-    @varm.setter
-    def varm(self, value):
-        self._varm = value
-
-    @property
-    def varp(self):
-        return self._varp
-
-    @varp.setter
-    def varp(self, value):
-        self._varp = value
-
-    @property
-    def obsp(self):
-        return self._obsp
-
-    @obsp.setter
-    def obsp(self, value):
-        self._obsp = value
+            dims = self._data[self._primary].dims
+            self._data[self._primary] = _to_dataarray(np.asarray(value), dims)
 
     @property
     def shape(self):
-        return self._X.shape
-        
-    @property
-    def obs_names(self):
-        return self.obs.index
+        return self._data[self._primary].shape
 
-    @property
-    def var_names(self):
-        return self.var.index
-        
-    @property
-    def n_obs(self):
-        return len(self.obs.index)
-
-    @property
-    def n_vars(self):
-        return len(self.var.index)
-    
     def copy(self):
-        return CrAnData(
-            self._X.copy(),
-            obs=self._obs.copy(),
-            var=self._var.copy(),
-            uns=self.uns.copy(),
-            obsm={k: v.copy() for k, v in self.obsm.items()},
-            varm={k: v.copy() for k, v in self.varm.items()},
-            layers=self.layers.copy(),
-            varp={k: v.copy() for k, v in self.varp.items()} if self.varp is not None else {},
-            obsp=self.obsp.copy() if self.obsp is not None else None,
-            filename=self.filename,
-        )
+        return copy.deepcopy(self)
 
     def __getitem__(self, key):
+        """
+        Slice the primary array using the provided indices.
+        Further slicing is disallowed on a backed CrAnData that has already been sliced.
+        """
+        if (hasattr(self._data[self._primary], "attrs") and "_lazy_obj" in self._data[self._primary].attrs
+            and self._is_sliced):
+            raise ValueError("Cannot further slice into a backed CrAnData object that has already been sliced.")
         if not isinstance(key, tuple):
-            key = (key, slice(None))
-        if len(key) != 2:
-            raise IndexError("Only two indices (obs, var) are supported for slicing.")
-        obs_key, var_key = key
-        new_X = self._X.isel(obs=obs_key, var=var_key)
-        new_obs = self._obs.iloc[obs_key]
-        new_var = self._var.iloc[var_key]
-        new_uns = self.uns.copy()
-        new_layers = self.layers.copy()
-        new_obsm = {k: v.isel(obs=obs_key) for k, v in self.obsm.items()}
-        new_varm = {k: v.isel(var=var_key) for k, v in self.varm.items()}
-        new_varp = {}
-        for k, v in self.varp.items():
-            new_varp[k] = v.isel(var_0=var_key, var_1=var_key)
-        new_obsp = self.obsp
-        if new_obsp is not None:
-            new_obsp = new_obsp.isel(obs_0=obs_key, obs_1=obs_key)
-        return CrAnData(new_X, obs=new_obs, var=new_var, uns=new_uns,
-                        layers=new_layers, obsm=new_obsm, varm=new_varm,
-                        varp=new_varp, obsp=new_obsp, filename=self.filename)
-
-    def _subset_df(self, df, key):
-        if isinstance(key, (int, np.integer)):
-            return df.iloc[[key]]
-        elif isinstance(key, slice):
-            return df.iloc[key]
-        else:
-            return df.loc[key]
+            key = (key,)
+        new_data = {}
+        for prop, val in self._data.items():
+            if isinstance(val, xr.DataArray):
+                nd = val.ndim
+                key_padded = key + (slice(None),) * (nd - len(key)) if len(key) < nd else key[:nd]
+                indexers = {dim: key_padded[i] for i, dim in enumerate(val.dims[:len(key_padded)])}
+                new_data[prop] = val.isel(**indexers)
+            else:
+                new_data[prop] = val
+        new_obj = CrAnData(primary_key=self._primary, global_axis_order=self.global_axis_order,
+                           axis_indices=self.axis_indices, properties_config=self._properties_config,
+                           **new_data)
+        new_obj._is_sliced = True
+        return new_obj
 
     def __repr__(self):
-        n_obs = self._X.sizes["obs"]
-        n_var = self._X.sizes["var"]
-        return f"CrAnData object with {n_obs} observations and {n_var} variables"
+        lines = []
+        primary_arr = self._data[self._primary]
+        axes_info = []
+        for d in primary_arr.dims:
+            size = primary_arr.sizes[d]
+            backed = "backed" if (hasattr(primary_arr, "attrs") and "_lazy_obj" in primary_arr.attrs) else "in-memory"
+            axes_info.append(f"{d}={size} ({backed})")
+        lines.append(f"CrAnData (primary: '{self._primary}') with axes: " + ", ".join(axes_info))
+        for key, val in self._data.items():
+            if isinstance(val, xr.DataArray):
+                dims_str = ", ".join([f"{d}={val.sizes[d]}" for d in val.dims])
+                backed = "backed" if (hasattr(val, "attrs") and "_lazy_obj" in val.attrs) else "in-memory"
+                lines.append(f"  {key}: [{dims_str}] ({backed})")
+            else:
+                lines.append(f"  {key}: {val}")
+        return "\n".join(lines)
 
-    def to_h5(self, h5_path: str):
-        """
-        Save all attributes of CrAnData in a standardized way.
-        """
-        attr_dict = {
-            "X": self._X,
-            "obs": self._obs,
-            "var": self._var,
-            "uns": self.uns,
-            "layers": self.layers,
-            "obsm": self.obsm,
-            "varm": self.varm,
-            "varp": self.varp,
-            "obsp": self.obsp,
-        }
+    def to_h5(self, h5_path: str, chunk_sizes: dict[str, int] | None = None):
         with h5py.File(h5_path, "w") as f:
-            for key, value in attr_dict.items():
+            for key, value in self._data.items():
                 if value is None:
                     continue
-                _save_generic_attr(f, key, value)
+                if isinstance(value, xr.DataArray):
+                    _save_xarray(f, key, value, chunk_sizes=chunk_sizes)
+                else:
+                    _save_generic_attr(f, key, value)
+            f.attrs["global_axis_order"] = (
+                ",".join(self.global_axis_order) if self.global_axis_order else ""
+            )
+            f.attrs["primary_key"] = self._primary
+            f.attrs["filename"] = self.filename if self.filename is not None else ""
+            f.attrs["properties_config"] = json.dumps(self._properties_config)
 
     @classmethod
-    def from_h5(cls, h5_path: str, backed: list[str] = ["X", "varp", "varm"]):
-        attr_dict = {}
+    def from_h5(cls, h5_path: str, backed: list[str] = None):
+        data = {}
         with h5py.File(h5_path, "r") as f:
             for key in f:
-                attr_dict[key] = _load_generic_attr(f, key, key in backed)
-        # Ensure that layers (and similar mapping-type attributes) are dictionaries.
-        if not isinstance(attr_dict.get("layers", {}), dict):
-            attr_dict["layers"] = {}
-        if not isinstance(attr_dict.get("obsm", {}), dict):
-            attr_dict["obsm"] = {}
-        if not isinstance(attr_dict.get("varm", {}), dict):
-            attr_dict["varm"] = {}
-        if not isinstance(attr_dict.get("varp", {}), dict):
-            attr_dict["varp"] = {}
-        if not isinstance(attr_dict.get("obsp", {}), dict):
-            attr_dict["obsp"] = {}
-    
-        return cls(X=attr_dict["X"],
-                   obs=attr_dict["obs"],
-                   var=attr_dict["var"],
-                   uns=attr_dict.get("uns", {}),
-                   layers=attr_dict.get("layers", {}),
-                   obsm=attr_dict.get("obsm", {}),
-                   varm=attr_dict.get("varm", {}),
-                   varp=attr_dict.get("varp", {}),
-                   obsp=attr_dict.get("obsp", None))
+                data[key] = _load_generic_attr(f, key, backed=(key in backed if backed else False))
+            global_axis_order_str = f.attrs.get("global_axis_order", "")
+            global_axis_order = global_axis_order_str.split(",") if global_axis_order_str else None
+            primary_key = f.attrs.get("primary_key", "")
+            properties_config = json.loads(f.attrs.get("properties_config", "{}"))
+            filename = f.attrs.get("filename", "")
+        return cls(primary_key=primary_key, global_axis_order=global_axis_order,
+                   axis_indices={}, properties_config=properties_config, **data)
+
+    def to_memory(self):
+        """
+        Fully load all lazy (backed) xarray properties into memory.
+        """
+        for key, val in self._data.items():
+            if isinstance(val, xr.DataArray) and hasattr(val, "attrs") and "_lazy_obj" in val.attrs:
+                self._data[key] = xr.DataArray(val.values, dims=val.dims, coords=val.coords)

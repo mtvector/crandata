@@ -7,7 +7,7 @@ load data from your Yanndata files.
 from __future__ import annotations
 from os import PathLike
 import numpy as np
-from ._genome import Genome, _resolve_genome #Just copied from crested
+from ._genome import Genome, _resolve_genome  # Just copied from crested
 from anndata import AnnData
 from .crandata import CrAnData
 from ._dataloader import AnnDataLoader
@@ -19,11 +19,11 @@ def set_stage_sample_probs(adata: CrAnData, stage: str):
     for c in required_cols:
         if c not in adata.var:
             raise KeyError(f"Missing column {c} in adata.var")
-    sample_probs = np.zeros(adata.n_vars, dtype=float)
+    sample_probs = np.zeros(adata.n_var, dtype=float)
     if stage == "train":
         mask = (adata.var["split"] == "train")
         if "train_probs" not in adata.var:
-            adata.var["train_probs"] = 1.0
+            adata.var["train_probs"] = xr.DataArray(np.ones)
         adata.var["train_probs"] = adata.var["train_probs"] / adata.var["train_probs"].sum()
         sample_probs[mask] = adata.var["train_probs"][mask].values
         adata.var["sample_probs"] = sample_probs / sample_probs.sum()
@@ -39,6 +39,7 @@ def set_stage_sample_probs(adata: CrAnData, stage: str):
         adata.var["predict_probs"] = adata.var["predict_probs"] / adata.var["predict_probs"].sum()
     else:
         print("Invalid stage, sample probabilities unchanged")
+
 
 class AnnDataModule:
     """
@@ -64,7 +65,7 @@ class AnnDataModule:
       shuffle : bool
           Whether to shuffle training data.
       shuffle_obs : bool
-          Whether to shuffle the obs dimension of each batch
+          Whether to shuffle the obs dimension of each batch.
       batch_size : int
           Samples per batch.
       data_sources : dict[str, str]
@@ -92,7 +93,7 @@ class AnnDataModule:
         self.max_stochastic_shift = max_stochastic_shift
         self.deterministic_shift = deterministic_shift
         self.shuffle = shuffle
-        self.shuffle_obs = shuffle_obs
+        self.shuffle_obs = False  # Ensure this is defined (or passed in)
         self.batch_size = batch_size
         self.data_sources = data_sources
 
@@ -162,6 +163,7 @@ class AnnDataModule:
             shuffle=self.shuffle,
             shuffle_obs=self.shuffle_obs,
             drop_remainder=False,
+            epoch_size=100_000,
             stage='train'
         )
 
@@ -174,6 +176,7 @@ class AnnDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             drop_remainder=False,
+            epoch_size=100_000,
             stage='val'
         )
 
@@ -186,6 +189,7 @@ class AnnDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             drop_remainder=False,
+            epoch_size=100_000,
             stage='test'
         )
 
@@ -198,14 +202,17 @@ class AnnDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             drop_remainder=False,
+            epoch_size=100_000,
             stage='predict'
         )
 
     def __repr__(self):
-        return (f"AnnDataModule(adata_shape={self.adata.shape}, genome={self.genome}, "
-                f"in_memory={self.in_memory}, always_reverse_complement={self.always_reverse_complement}, "
-                f"random_reverse_complement={self.random_reverse_complement}, max_stochastic_shift={self.max_stochastic_shift}, "
-                f"shuffle={self.shuffle}, batch_size={self.batch_size})")
+        return (
+            f"AnnDataModule(adata_shape={self.adata.shape}, genome={self.genome}, "
+            f"in_memory={self.in_memory}, always_reverse_complement={self.always_reverse_complement}, "
+            f"random_reverse_complement={self.random_reverse_complement}, max_stochastic_shift={self.max_stochastic_shift}, "
+            f"shuffle={self.shuffle}, batch_size={self.batch_size})"
+        )
 
 
 class MetaAnnDataModule:
@@ -314,21 +321,6 @@ class MetaAnnDataModule:
             self.train_dataset = MetaAnnDataset(train_datasets)
             self.val_dataset = MetaAnnDataset(val_datasets)
             
-            # for ds in self.train_dataset.datasets:  
-            #     # Assume each dataset is an AnnDataset that wraps a CrAnData with adata.var and augmented_probs.
-            #     # Group local (augmented) indices by their chunk_index (which was added to adata.var)
-            #     chunk_groups = defaultdict(list)
-            #     for local_idx, chunk in enumerate(ds.adata.var["chunk_index"].to_numpy()):
-            #         # Here you may need to adjust if the augmented indices differ from the order in adata.var.
-            #         chunk_groups[chunk].append(local_idx)
-            #     ds.chunk_groups = dict(chunk_groups)
-            #     # Compute the sum of the unnormalized augmented probabilities within each chunk:
-            #     chunk_weights = {}
-            #     for ch, indices in ds.chunk_groups.items():
-            #         # ds.augmented_probs should be a numpy array whose length matches the number of variables.
-            #         chunk_weights[ch] = ds.augmented_probs[indices].sum()
-            #     ds.chunk_weights = chunk_weights
-
             for ds in self.train_dataset.datasets:
                 if "chunk_index" in ds.adata.var.columns:
                     chunk_groups = defaultdict(list)
@@ -341,12 +333,10 @@ class MetaAnnDataModule:
                 ds.chunk_weights = {ch: ds.augmented_probs[indices].sum()
                                     for ch, indices in ds.chunk_groups.items()}
             
-            # Also compute a per-dataset (file) weight:
             file_weights = []
             for ds in self.train_dataset.datasets:
                 file_weights.append(ds.augmented_probs.sum())
             self.file_weights = np.array(file_weights)
-            # Normalize to get file probabilities:
             self.file_probs = self.file_weights / self.file_weights.sum()
             self.train_dataset.file_probs = self.file_probs
 
@@ -378,7 +368,6 @@ class MetaAnnDataModule:
 
         else:
             raise ValueError(f"Invalid stage: {stage}")
-
 
     @property
     def train_dataloader(self):

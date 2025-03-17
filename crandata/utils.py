@@ -221,3 +221,4 @@ def reverse_complement(sequence: str | list[str] | np.ndarray) -> str | np.ndarr
         raise TypeError(
             "Input must be either a DNA sequence string or a one-hot encoded array"
         )
+
