@@ -14,8 +14,13 @@ try:
 except ImportError:
     sparse = None
 
-# Instead of LazyData and reindex_obs_array (no longer used in crandata.py),
-# we define a simple reindexing function that aligns the observation dimension.
+# Optionally try to use xbatcher for batching.
+try:
+    import xbatcher
+except ImportError:
+    xbatcher = None
+
+# Instead of the old LazyData and reindex_obs_array, we define a simple reindexing helper.
 def _reindex_obs_array(arr: np.ndarray, local_obs: np.ndarray, global_obs: np.ndarray) -> np.ndarray:
     """
     Reindex the observation axis of an array so that its first dimension matches the global observations.
@@ -23,7 +28,6 @@ def _reindex_obs_array(arr: np.ndarray, local_obs: np.ndarray, global_obs: np.nd
     """
     new_shape = (len(global_obs),) + arr.shape[1:]
     new_arr = np.full(new_shape, np.nan, dtype=arr.dtype)
-    # Build a mapping from observation name to its global index.
     local_to_global = {obs: i for i, obs in enumerate(global_obs)}
     for i, obs in enumerate(local_obs):
         if obs in local_to_global:
@@ -35,10 +39,11 @@ from ._dataset import AnnDataset, MetaAnnDataset
 os.environ["KERAS_BACKEND"] = "torch"
 
 def _shuffle_obs_in_sample(sample: dict) -> dict:
+    # Determine number of observations from the "sequence" key or from any array.
+    n_obs = None
     if "sequence" in sample:
         n_obs = sample["sequence"].shape[0]
     else:
-        n_obs = None
         for val in sample.values():
             arr = np.asarray(val)
             if arr.ndim > 0:
@@ -56,7 +61,7 @@ def _shuffle_obs_in_sample(sample: dict) -> dict:
             new_sample[key] = arr
     return new_sample
 
-# Sampler classes remain unchanged.
+# --- Sampler classes remain largely unchanged ---
 class WeightedRegionSampler(Sampler):
     def __init__(self, dataset: AnnDataset, epoch_size: int = 100_000):
         super().__init__(data_source=dataset)
@@ -154,10 +159,11 @@ class GroupedChunkMetaSampler(Sampler):
     def __len__(self):
         return self.epoch_size
 
+# --- Dataloader class ---
 class AnnDataLoader:
     def __init__(
         self,
-        dataset,  # can be AnnDataset or MetaAnnDataset
+        dataset,  # either AnnDataset or MetaAnnDataset
         batch_size: int,
         shuffle: bool = False,
         drop_remainder: bool = True,
@@ -174,7 +180,6 @@ class AnnDataLoader:
         self.shuffle_obs = shuffle_obs
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         self.sampler = None
 
         if isinstance(dataset, MetaAnnDataset):
@@ -192,51 +197,54 @@ class AnnDataLoader:
                 if self.shuffle and hasattr(self.dataset, "shuffle"):
                     self.dataset.shuffle = True
 
-    def batch_collate_fn(self, batch):
+    def batch_collate_fn(self, batch: list[dict]) -> dict:
         collated = {}
-        # Use meta_obs_names and local obs names if available.
+        # Determine global observation names from the first dataset.
         if hasattr(self.dataset, "datasets") and len(self.dataset.datasets) > 0:
             global_obs = np.array(self.dataset.datasets[0].adata.meta_obs_names)
-            local_obs = np.array(self.dataset.datasets[0].adata.obs.index)
+            local_obs = np.array(self.dataset.datasets[0].adata.meta_obs_names)
         else:
-            global_obs = np.array(self.dataset.adata.obs.index)
+            # If not a meta dataset, assume the AnnDataset has a property for obs names.
+            global_obs = np.array(self.dataset.adata.meta_obs_names)
             local_obs = global_obs
         for key in batch[0]:
-            
             tensors = []
             for sample in batch:
                 val = sample[key]
-                # Check if the value is backed by a sparse array.
+                # If backed by a sparse array, densify.
                 if hasattr(val, "data") and hasattr(val.data, "todense"):
-                    print(key,val.data.todense())
                     arr = np.array(val.data.todense())
                 else:
                     arr = np.array(val)
                 if arr.ndim == 0:
                     arr = np.expand_dims(arr, 0)
-                # For non-sequence keys, reindex the obs dimension if necessary.
-                if global_obs is not None and key not in ["sequence"] and arr.shape[0] != len(global_obs):
+                # For keys other than "sequence", if the obs dimension is smaller than global_obs, reindex.
+                if global_obs is not None and key != "sequence" and arr.shape[0] != len(global_obs):
                     arr = _reindex_obs_array(arr, local_obs, global_obs)
                 tensors.append(torch.as_tensor(arr, dtype=torch.float32))
-            # Stack along dim=1 so that the original obs dimension remains at dim 0
-            # and the batch dimension is inserted as dim 1.
+            # Stack tensors along a new batch dimension.
             stacked = torch.stack(tensors, dim=1)
             collated[key] = stacked
-        print(collated)
-        # Shuffle observations (dim 0) based on meta_obs_names.
+        # Optionally shuffle observations (first dimension) if desired.
         if self.shuffle_obs and global_obs is not None:
             perm = torch.randperm(len(global_obs))
             for key in collated:
                 collated[key] = collated[key][perm]
-        
-        if self.device is not None:
-            for key in collated:
-                collated[key] = collated[key].to(self.device)
+        for key in collated:
+            collated[key] = collated[key].to(self.device)
         return collated
-        
+
     def _create_dataset(self):
-        from torch.utils.data import DataLoader
-        if os.environ.get("KERAS_BACKEND", "") == "torch":
+        # If xbatcher is available, use it; otherwise fall back to torch DataLoader.
+        if xbatcher is not None:
+            return xbatcher.DataLoader(
+                self.dataset,
+                batch_size=self.batch_size,
+                sampler=self.sampler,
+                drop_last=self.drop_remainder,
+                collate_fn=self.batch_collate_fn,
+            )
+        else:
             if self.sampler is not None:
                 return DataLoader(
                     self.dataset,
@@ -255,8 +263,6 @@ class AnnDataLoader:
                     num_workers=0,
                     collate_fn=self.batch_collate_fn,
                 )
-        else:
-            raise NotImplementedError("TensorFlow backend not implemented yet.")
 
     @property
     def data(self):

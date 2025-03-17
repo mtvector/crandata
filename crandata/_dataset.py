@@ -1,23 +1,27 @@
+"""_dataset.py – Dataset class for combining genome files and CrAnData objects
+using a unified data_sources interface.
+"""
+
+from __future__ import annotations
+
 import os
 import re
 import numpy as np
 import pandas as pd
 import xarray as xr
-from .crandata import CrAnData
 from loguru import logger
 from scipy.sparse import spmatrix
 from tqdm import tqdm
+from .crandata import CrAnData
 from ._genome import Genome
 from .utils import one_hot_encode_sequence
 
+# --- Helper functions for sequence region manipulation ---
 def _flip_region_strand(region: str) -> str:
     strand_reverser = {"+": "-", "-": "+"}
     return region[:-1] + strand_reverser[region[-1]]
 
 def _check_strandedness(region: str) -> bool:
-    # Ensure region is a string (decode bytes if necessary)
-    if isinstance(region, bytes):
-        region = region.decode("utf-8")
     if re.fullmatch(r".+:\d+-\d+:[-+]", region):
         return True
     elif re.fullmatch(r".+:\d+-\d+", region):
@@ -37,6 +41,26 @@ def _deterministic_shift_region(region: str, stride: int = 50, n_shifts: int = 2
         new_regions.append(f"{chrom}:{new_start}-{new_end}:{strand}")
     return new_regions
 
+# --- Helper functions to reconstruct metadata ---
+def get_obs_df(adata: CrAnData) -> pd.DataFrame:
+    """Reconstruct observation DataFrame from keys starting with 'obs/'."""
+    if "obs/index" in adata:
+        index = adata["obs/index"].values
+    else:
+        index = None
+    obs_cols = {key[4:]: adata[key].values for key in adata.data_vars if key.startswith("obs/") and key != "obs/index"}
+    return pd.DataFrame(obs_cols, index=index)
+
+def get_var_df(adata: CrAnData) -> pd.DataFrame:
+    """Reconstruct variable DataFrame from keys starting with 'var/'."""
+    if "var/index" in adata:
+        index = adata["var/index"].values
+    else:
+        index = None
+    var_cols = {key[4:]: adata[key].values for key in adata.data_vars if key.startswith("var/") and key != "var/index"}
+    return pd.DataFrame(var_cols, index=index)
+
+# --- SequenceLoader class ---
 class SequenceLoader:
     def __init__(
         self,
@@ -55,12 +79,8 @@ class SequenceLoader:
         self.max_stochastic_shift = max_stochastic_shift
         self.sequences = {}
         self.complement = str.maketrans("ACGT", "TGCA")
-        # Ensure regions are strings (decode bytes if necessary)
-        if regions is not None:
-            self.regions = [r.decode("utf-8") if isinstance(r, bytes) else r for r in regions]
-        else:
-            self.regions = None
-        if self.in_memory and self.regions is not None:
+        self.regions = regions
+        if self.in_memory and self.regions:
             self._load_sequences_into_memory(self.regions)
 
     def _load_sequences_into_memory(self, regions: list[str]):
@@ -84,13 +104,13 @@ class SequenceLoader:
         if self.chromsizes and chrom in self.chromsizes:
             chrom_size = self.chromsizes[chrom]
             if extended_end > chrom_size:
+                extended_start = chrom_size - (end - start + self.max_stochastic_shift * 2)
                 extended_end = chrom_size
-                extended_start = max(0, extended_end - (end - start + self.max_stochastic_shift * 2))
         seq = self.genome.fetch(chrom, extended_start, extended_end).upper()
         if strand == "-":
             seq = self._reverse_complement(seq)
         return seq
-        
+
     def _reverse_complement(self, sequence: str) -> str:
         return sequence.translate(self.complement)[::-1]
 
@@ -109,6 +129,7 @@ class SequenceLoader:
             sub_sequence = sub_sequence.ljust(end - start, "N") if strand == "+" else sub_sequence.rjust(end - start, "N")
         return sub_sequence
 
+# --- IndexManager class ---
 class IndexManager:
     def __init__(self, indices: list[str], always_reverse_complement: bool, deterministic_shift: bool = False):
         self.indices = indices
@@ -123,9 +144,6 @@ class IndexManager:
         augmented_indices = []
         augmented_indices_map = {}
         for region in indices:
-            # Ensure region is a string
-            if isinstance(region, bytes):
-                region = region.decode("utf-8")
             stranded_region = region if _check_strandedness(region) else f"{region}:+"
             if self.deterministic_shift:
                 shifted_regions = _deterministic_shift_region(stranded_region)
@@ -145,6 +163,7 @@ class IndexManager:
                     augmented_indices_map[rc] = region
         return augmented_indices, augmented_indices_map
 
+# --- AnnDataset class ---
 if os.environ.get("KERAS_BACKEND") == "pytorch":
     import torch
     BaseClass = torch.utils.data.Dataset
@@ -194,42 +213,29 @@ class AnnDataset(BaseClass):
         except Exception:
             pass
         self.adata = adata
-        # Convert X to xarray if needed:
-        if not isinstance(self.adata.X, xr.DataArray):
-            arr = np.asarray(self.adata.X)
-            extra = arr.ndim - 2
-            dims = ["obs", "var"] + [f"dim_{i}" for i in range(extra)]
-            self.adata.X = xr.DataArray(arr, dims=dims)
-        # If global_axis_order is empty, set it to the dims of X.
-        if not self.adata.global_axis_order:
-            self.adata.global_axis_order = list(self.adata.X.dims)
-        n_obs, n_var = self.adata.X.sizes["obs"], self.adata.X.sizes["var"]
-        self.genome = genome
 
-        # Validate obs and var consistency
-        if self.adata.obs is None:
-            self.adata.obs = pd.DataFrame(index=[str(i) for i in range(n_obs)])
-        if self.adata.var is None:
-            self.adata.var = pd.DataFrame(index=[str(i) for i in range(n_var)])
+        # Reconstruct metadata DataFrames from the new CrAnData keys.
+        obs_df = get_obs_df(self.adata)
+        var_df = get_var_df(self.adata)
 
-        self.adata.X = self.adata.X.assign_coords(obs=("obs", np.array(self.adata.obs.index)),
-                                                   var=("var", np.array(self.adata.var.index)))
-        self.uns = self.adata.uns if self.adata.uns is not None else {}
-        self.layers = self.adata.layers if self.adata.layers is not None else {}
+        # Get X from the dataset (assumed stored under key "X")
+        X = self.adata["X"]
+        # Assign coordinates using the reconstructed indices.
+        X = X.assign_coords(obs=("obs", np.array(obs_df.index)),
+                            var=("var", np.array(var_df.index)))
+        self.adata["X"] = X  # update stored X
+
+        self.uns = {}  # New CrAnData does not support uns by default.
+        self.layers = {}  # Similarly, layers and varp/obsm default to empty.
         self.data_sources = data_sources
 
-        self.compressed = isinstance(self.adata.X, spmatrix)
-        # Use the index from the var DataFrame directly.
-        chrom = list(self.genome.chrom_sizes.keys())[0]
-        chrom_length = self.genome.chrom_sizes[chrom]
-        self.indices = [f"{chrom}:0-{chrom_length}:+"] * len(self.adata.obs)
-
+        self.compressed = isinstance(X.data, spmatrix)
+        self.indices = list(var_df.index)
         self.index_map = {index: i for i, index in enumerate(self.indices)}
-        self.num_outputs = self.adata.X.shape[0]
+        self.num_outputs = X.shape[0]
         self.random_reverse_complement = random_reverse_complement
         self.max_stochastic_shift = max_stochastic_shift
-        # Use the obs DataFrame index for meta observations.
-        self.meta_obs_names = np.array(self.adata.obs.index)
+        self.meta_obs_names = np.array(obs_df.index)
         self.shuffle = False
 
         self.sequence_loader = SequenceLoader(
@@ -245,17 +251,19 @@ class AnnDataset(BaseClass):
             always_reverse_complement=always_reverse_complement,
             deterministic_shift=deterministic_shift,
         )
-        self.region_width = (
-            self.adata.uns.get('params', {}).get('target_region_width',
-                int(np.round(np.mean(self.adata.var['end'] - self.adata.var['start']))) - (2 * self.max_stochastic_shift)
-            )
-        )
+        # Determine region width from stored parameters or var metadata.
+        try:
+            params = self.adata.attrs.get("params", "{}")
+            params = params if isinstance(params, dict) else pd.io.json.loads(params)
+            self.region_width = params.get('target_region_width', int(np.round(np.mean(var_df['end'] - var_df['start']))) - (2 * self.max_stochastic_shift))
+        except Exception:
+            self.region_width = int(np.round(np.mean(var_df['end'] - var_df['start'])))
 
         # Set augmented probabilities based on split.
-        if split in ['train', 'val', 'test', 'predict']:
-            probs = self.adata.var[f"{split}_probs"].values.astype(float)
+        if split in ['train', 'val', 'test', 'predict'] and f"{split}_probs" in var_df.columns:
+            probs = var_df[f"{split}_probs"].values.astype(float)
         else:
-            probs = np.ones(self.adata.shape[1])
+            probs = np.ones(X.sizes["var"])
         probs = np.clip(probs, 0, None)
         n_aug = len(self.index_manager.augmented_indices)
         self.augmented_probs = np.ones(n_aug, dtype=float)
@@ -284,10 +292,11 @@ class AnnDataset(BaseClass):
                 item[key] = self._get_data_array(source_str, original_index, shift=shift)
             elif source_str.startswith("obs/"):
                 col = source_str.split("/", 1)[1]
-                item[key] = self.adata.obs[col].values
+                item[key] = get_obs_df(self.adata)[col].values
             elif source_str.startswith("obsm/"):
                 key_name = source_str.split("/", 1)[1]
-                item[key] = self.adata.obsm[key_name].values
+                # For simplicity, assume obsm is empty in the new version.
+                item[key] = None
             else:
                 raise ValueError(f"Unknown data source prefix in '{source_str}'")
         return item
@@ -295,16 +304,32 @@ class AnnDataset(BaseClass):
     def _get_data_array(self, source_str: str, varname: str, shift: int = 0):
         var_idx = self.index_map[varname]
         if source_str == "X":
-            # Directly index the xarray object.
-            return self.adata.X[var_idx,:]
+            lazy_obj = self.adata["X"].data
+            if hasattr(lazy_obj, "filename"):
+                key = (slice(None), var_idx)
+                return LazyData(lazy_obj, key,
+                                local_obs=np.array(get_obs_df(self.adata).index),
+                                global_obs=np.array(self.meta_obs_names))
+            else:
+                return self.adata["X"][:, var_idx]
         elif source_str.startswith("layers/"):
             key_name = source_str.split("/", 1)[1]
             start_idx = self.max_stochastic_shift + shift
             end_idx = start_idx + self.region_width
-            return self.adata.layers[key_name][..., start_idx:end_idx]
+            if key_name in self.layers and hasattr(self.layers[key_name].data, "filename"):
+                lazy_obj = self.layers[key_name].data
+                key_tuple = (self.meta_obs_names, var_idx, slice(start_idx, end_idx))
+                return LazyData(lazy_obj, key_tuple,
+                                local_obs=np.array(get_obs_df(self.adata).index),
+                                global_obs=np.array(self.meta_obs_names))
+            return self.layers.get(key_name)[self.meta_obs_names, var_idx][..., start_idx:end_idx]
         elif source_str.startswith("varp/"):
             key_name = source_str.split("/", 1)[1]
-            return self.adata.varp[key_name][var_idx]
+            if key_name in self.uns and hasattr(self.uns[key_name].data, "filename"):
+                lazy_obj = self.uns[key_name].data
+                key_tuple = (var_idx,)
+                return LazyData(lazy_obj, key_tuple)
+            return self.uns.get(key_name)[var_idx]
         else:
             raise ValueError(f"Data source '{source_str}' is not indexable by variable.")
 
@@ -318,9 +343,9 @@ class AnnDataset(BaseClass):
         return len(self.index_manager.augmented_indices)
 
     def __repr__(self) -> str:
-        return (f"AnnDataset(anndata_shape={self.adata.shape}, n_samples={len(self)}, "
-                f"num_outputs={self.num_outputs}, split={self.adata.var.get('split', 'None')}, "
-                f"in_memory={self.adata.X is not None})")
+        return (f"AnnDataset(adata_shape={self.adata['X'].shape}, n_samples={len(self)}, "
+                f"num_outputs={self.num_outputs}, split={self.adata.attrs.get('split', 'None')}, "
+                f"in_memory={'Yes' if 'obs/index' in self.adata else 'No'})")
 
 class MetaAnnDataset:
     def __init__(self, datasets: list[AnnDataset]):
@@ -352,7 +377,6 @@ class MetaAnnDataset:
         return len(self.global_indices)
 
     def __getitem__(self, global_idx):
-        # If global_idx is a tuple, assume it's already (ds_idx, local_i)
         if isinstance(global_idx, tuple):
             ds_idx, local_i = global_idx
         else:

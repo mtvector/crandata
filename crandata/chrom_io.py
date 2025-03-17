@@ -6,14 +6,17 @@ import re
 import tempfile
 from pathlib import Path
 import numpy as np
+import pandas as pd
 import pybigtools
 from loguru import logger
 from tqdm import tqdm
+from . import _conf
 from collections import defaultdict
 import xarray as xr
 import sparse
+import json
 import h5py  # for HDF5 backing
-from . import _conf
+from . import crandata
 from .crandata import CrAnData
 
 # -----------------------
@@ -41,12 +44,10 @@ def _custom_region_sort(region: str) -> tuple[int, int, int]:
         return (1, chrom, start)
 
 def _read_chromsizes(chromsizes_file: Path) -> dict[str, int]:
-    # We still use pandas here for convenience, but its output is only used transiently.
-    import pandas as pd
     chromsizes = pd.read_csv(chromsizes_file, sep="\t", header=None, names=["chrom", "size"])
     return chromsizes.set_index("chrom")["size"].to_dict()
 
-def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str, n_bins: int = None) -> np.ndarray:
+def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bins: int = None) -> np.ndarray:
     bw_file = str(bw_file)
     bed_file = str(bed_file)
     with pybigtools.open(bw_file, "r") as bw:
@@ -92,12 +93,14 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str, n_bi
     elif target == "raw":
         with pybigtools.open(bw_file, "r") as bw:
             lines = open(temp_bed_file.name).readlines()
+            # print("Temporary BED lines:", lines)
             values_list = [
                 np.array(
                     bw.values(chrom, int(start), int(end), missing=0., exact=False, bins=n_bins, summary='mean')
                 )
                 for chrom, start, end in [line.split("\t")[:3] for line in lines]
             ]
+            # print("Extracted values shapes:", [v.shape for v in values_list])
             values = np.vstack(values_list)
     else:
         raise ValueError(f"Unsupported target '{target}'")
@@ -114,9 +117,7 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str, n_bi
         else:
             return values
 
-def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = None):
-    # Use pandas temporarily to read the BED file, then convert to numpy arrays.
-    import pandas as pd
+def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = None) -> pd.DataFrame:
     if chromsizes_dict is None and not _conf.genome:
         logger.warning("Chromsizes file not provided. Will not check if regions are within chromosomes", stacklevel=1)
     consensus_peaks = pd.read_csv(
@@ -127,7 +128,9 @@ def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = N
         dtype={0: str, 1: "Int32", 2: "Int32"},
     )
     consensus_peaks.columns = ["chrom", "start", "end"]
-    consensus_peaks["region"] = consensus_peaks["chrom"].astype(str) + ":" + consensus_peaks["start"].astype(str) + "-" + consensus_peaks["end"].astype(str)
+    consensus_peaks["region"] = consensus_peaks["chrom"].astype(str) + ":" + \
+                                consensus_peaks["start"].astype(str) + "-" + \
+                                consensus_peaks["end"].astype(str)
     if chromsizes_dict:
         pass
     elif _conf.genome:
@@ -143,8 +146,7 @@ def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = N
         logger.warning(f"Filtered {len(consensus_peaks) - len(consensus_peaks_filtered)} consensus regions (not within chromosomes)")
     return consensus_peaks_filtered
 
-def _create_temp_bed_file(consensus_peaks, target_region_width: int, adjust=True) -> str:
-    # Using the pandas DataFrame from _read_consensus_regions here.
+def _create_temp_bed_file(consensus_peaks: pd.DataFrame, target_region_width: int, adjust=True) -> str:
     adjusted_peaks = consensus_peaks.copy()
     if adjust:
         adjusted_peaks[1] = adjusted_peaks.apply(
@@ -167,10 +169,10 @@ def _check_bed_file_format(bed_file: Path) -> None:
     if not re.match(pattern, first_line):
         raise ValueError(f"BED file '{bed_file}' is not in the correct format. Expected columns 2 and 3 to contain integers.")
 
-def _filter_and_adjust_chromosome_data(peaks, chrom_sizes: dict,
+def _filter_and_adjust_chromosome_data(peaks: pd.DataFrame, chrom_sizes: dict,
                                       max_shift: int = 0, chrom_col: str = "chrom",
                                       start_col: str = "start", end_col: str = "end",
-                                      MIN_POS: int = 0):
+                                      MIN_POS: int = 0) -> pd.DataFrame:
     peaks["_chr_size"] = peaks[chrom_col].map(chrom_sizes)
     peaks = peaks.dropna(subset=["_chr_size"]).copy()
     peaks["_chr_size"] = peaks["_chr_size"].astype(int)
@@ -199,38 +201,54 @@ def _filter_and_adjust_chromosome_data(peaks, chrom_sizes: dict,
 # -----------------------
 # X array writing
 # -----------------------
-
 def _load_x_to_memory(bw_files, consensus_peaks, target, target_region_width,
-                      out_path, obs_index, var_index, chunk_size=1024, n_bins=None) -> xr.DataArray:
+                      out_path, obs_index, var_index, chunk_size=1024,n_bins=None):
     """
     Write training data (extracted from bigWig files) to an HDF5 file.
     The final shape is (n_obs, n_var, seq_len).
+
+    Parameters:
+      bw_files: list of bigWig file paths (one per observation)
+      consensus_peaks: DataFrame of consensus regions (used for creating a temporary BED)
+      target: extraction mode (e.g. "mean", "max", "raw", etc.)
+      target_region_width: integer width for the regions to extract
+      out_path: path to an HDF5 file to create or overwrite
+      obs_index: pandas Index for observations (rows)
+      var_index: pandas Index for variables (columns)
+      chunk_size: number of regions (columns) per chunk
+      n_bins: number of bins to take interpolated means, None gives full length
+    Returns:
+      X: an xarray DataArray backed by the HDF5 dataset with dims ["obs", "var", "seq_len"]
     """
     n_obs = len(bw_files)
     n_var = consensus_peaks.shape[0]
     
     # Determine sequence length using the first file.
     temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target, n_bins=n_bins)
+    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target,n_bins=n_bins)
     os.remove(temp_bed)
     if sample.ndim == 1:
         sample = sample.reshape(n_var, 1)
     seq_len = sample.shape[1]
     chunk_size = min(chunk_size, n_var)
     
+    # Create an HDF5 file and preallocate a dataset "X"
     with h5py.File(out_path, "w") as f:
         dset = f.create_dataset("X", shape=(n_obs, n_var, seq_len),
                                 chunks=(n_obs, chunk_size, seq_len),
                                 dtype="float32",
                                 fillvalue=np.nan)
+        # Write each observation row into the dataset.
         for i, bw_file in tqdm(enumerate(bw_files)):
             temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-            result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
+            result = _extract_values_from_bigwig(bw_file, temp_bed, target=target,n_bins=n_bins)
             os.remove(temp_bed)
             if result.ndim == 1:
                 result = result.reshape(n_var, 1)
             dset[i, :, :] = result
+            # print(f"Wrote row {i+1}/{n_obs} from {bw_file}")
     
+    # Read the dataset into a NumPy array and wrap it in an xarray DataArray.
     with h5py.File(out_path, "r") as f:
         X_array = f["X"][:]
     X = xr.DataArray(X_array, dims=["obs", "var", "seq_len"],
@@ -239,9 +257,71 @@ def _load_x_to_memory(bw_files, consensus_peaks, target, target_region_width,
                              "seq_len": np.arange(seq_len)})
     return X
 
-# -----------------------
-# Main import function
-# -----------------------
+# def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
+#                        out_path, obs_index, var_index, chunk_size=1024, n_bins=None):
+#     """
+#     Write training data (extracted from bigWig files) to an HDF5 file.
+#     The final dataset "X" is stored in chunks and will remain on disk.
+#     Additionally, the observation and variable metadata are saved as groups.
+#     The returned xarray DataArray is backed by a LazyH5Array referencing the dataset.
+
+#     Parameters:
+#       bw_files: list of bigWig file paths (one per observation)
+#       consensus_peaks: DataFrame of consensus regions (used for creating a temporary BED)
+#       target: extraction mode (e.g. "mean", "max", "raw", etc.)
+#       target_region_width: integer width for the regions to extract
+#       out_path: path to an HDF5 file to create or overwrite
+#       obs_index: pandas Index for observations (rows)
+#       var_index: pandas Index for variables (columns)
+#       chunk_size: number of regions (columns) per chunk
+#       n_bins: number of bins to take interpolated means; if None, returns full length
+
+#     Returns:
+#       X: an xarray DataArray whose data is lazily loaded from the HDF5 dataset "X",
+#          and which has dims ["obs", "var", "seq_len"].
+#     """
+#     n_obs = len(bw_files)
+#     n_var = consensus_peaks.shape[0]
+
+#     # Determine sequence length using the first file.
+#     temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
+#     sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target, n_bins=n_bins)
+#     os.remove(temp_bed)
+#     if sample.ndim == 1:
+#         sample = sample.reshape(n_var, 1)
+#     seq_len = sample.shape[1]
+#     chunk_size = min(chunk_size, n_var)
+
+#     with h5py.File(out_path, "w") as f:
+#         # Create dataset "X" with chunking; do not load into memory.
+#         dset = f.create_dataset(
+#             "X",
+#             shape=(n_obs, n_var, seq_len),
+#             chunks=(n_obs, chunk_size, seq_len),
+#             dtype="float32",
+#             fillvalue=np.nan,
+#         )
+#         # Write each observation (row) into the dataset.
+#         for i, bw_file in enumerate(bw_files):
+#             temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
+#             result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
+#             os.remove(temp_bed)
+#             if result.ndim == 1:
+#                 result = result.reshape(n_var, 1)
+#             dset[i, :, :] = result
+#             print(f"Wrote row {i+1}/{n_obs} from {bw_file}")
+#         crandata._save_dataframe(f, "obs", pd.DataFrame(obs_index))
+#         crandata._save_dataframe(f, "var", pd.DataFrame(var_index))
+#     # Instead of reading dset back into memory, wrap it in LazyH5Array.
+#     lazy_X = crandata.LazyH5Array(out_path, "X", shape=(n_obs, n_var, seq_len), dtype=dset.dtype, chunks=dset.chunks)
+#     # Create an xarray DataArray that is backed by the lazy loader.
+#     X = xr.DataArray(lazy_X, dims=["obs", "var", "seq_len"],
+#                      coords={"obs": np.array(obs_index),
+#                              "var": np.array(var_index),
+#                              "seq_len": np.arange(seq_len)})
+    
+#     return X
+
 
 def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                    backed_path: Path, target_region_width: int | None,
@@ -250,6 +330,51 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                    max_stochastic_shift: int = 0, chunk_size: int = 512, n_bins: int = None) -> CrAnData:
     """
     Import bigWig files and consensus regions to create a backed CrAnData object.
+
+    This function reads all valid bigWig files from a given directory, extracts signal values
+    over consensus regions specified in a BED file, and writes the resulting data (X) into an
+    HDF5 file for backing. The consensus regions are filtered and adjusted based on the target 
+    region width and any stochastic shifts provided. Chromosome sizes can be provided via a file
+    or through a genome object. Additional metadata is stored in the 'uns' attribute of the 
+    resulting CrAnData object.
+
+    Parameters:
+        bigwigs_folder (Path): Path to the directory containing bigWig files.
+        regions_file (Path): Path to the BED file defining consensus regions.
+        backed_path (Path): Path to the HDF5 file where the extracted X array will be stored.
+        target_region_width (int | None): The desired width of target regions for extraction.
+        target (str, optional): Extraction mode, e.g. "raw", "mean", "max", etc. Default is "raw".
+        chromsizes_file (Path | None, optional): Path to a file containing chromosome sizes.
+                                                 If provided, these sizes are used to validate regions.
+        genome (any, optional): A genome object which must have a `chrom_sizes` attribute.
+                                If provided, its chromosome sizes will be used.
+        max_stochastic_shift (int, optional): Maximum number of base pairs for stochastic shifting 
+                                              applied during region adjustment. Default is 0.
+        chunk_size (int, optional): Number of region columns per chunk when writing the HDF5 dataset.
+                                    Default is 512.
+        n_bin (int, optional): number of bins to take interpolated means, None gives all values.
+
+
+    Returns:
+        CrAnData: A CrAnData object whose X attribute is backed by the HDF5 file at `backed_path`.
+                  The object also contains obs and var DataFrames and metadata in its uns attribute 
+                  (including target_region_width, shifted_region_width, and max_stochastic_shift).
+
+    Raises:
+        FileNotFoundError: If `bigwigs_folder` is not a directory or if `regions_file` is not found.
+        FileNotFoundError: If no valid bigWig files are found in `bigwigs_folder`.
+
+    Workflow:
+        1. Validate input paths for the bigWig folder and regions file.
+        2. Read chromosome sizes from `chromsizes_file` or from the provided genome object.
+        3. Check the format of the regions (BED) file and load the consensus regions.
+        4. Filter consensus regions to keep those with a uniform width and adjust them based on 
+           `max_stochastic_shift`. The final target width is computed as 
+           `target_region_width + 2 * max_stochastic_shift`.
+        5. Collect all valid bigWig files from the directory.
+        6. Use `_load_x_to_memory` to extract the signal values from each bigWig file over the consensus 
+           regions and write the resulting data to an HDF5 file.
+        7. Create and return a CrAnData object wrapping the backed X array along with obs and var DataFrames.
     """
     bigwigs_folder = Path(bigwigs_folder)
     regions_file = Path(regions_file)
@@ -258,6 +383,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     if not regions_file.is_file():
         raise FileNotFoundError(f"File '{regions_file}' not found")
     
+    # Read chromosome sizes if provided.
     if chromsizes_file is not None:
         chromsizes_dict = _read_chromsizes(chromsizes_file)
     if genome is not None:
@@ -271,6 +397,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     shifted_width = target_region_width + 2 * max_stochastic_shift
     consensus_peaks = consensus_peaks.loc[(consensus_peaks['end'] - consensus_peaks['start']) == shifted_width, :]
     
+    # Collect valid bigWig files.
     bw_files = []
     chrom_set = set()
     for file in tqdm(os.listdir(bigwigs_folder)):
@@ -283,74 +410,92 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
         except (ValueError, pybigtools.BBIReadError):
             pass
     consensus_peaks = consensus_peaks.loc[consensus_peaks["chrom"].isin(chrom_set), :]
-    bw_files = sorted([os.path.join(bigwigs_folder, f) for f in os.listdir(bigwigs_folder)])
+    bw_files = sorted(bw_files)
     if not bw_files:
         raise FileNotFoundError(f"No valid bigWig files found in '{bigwigs_folder}'")
     
     logger.info(f"Extracting values from {len(bw_files)} bigWig files...")
-    # Instead of creating pandas DataFrames, we create numpy arrays and wrap them in xarray DataArrays.
-    obs_index = np.array([os.path.basename(f).rpartition(".")[0].replace(".", "_") for f in bw_files])
-    obs_array = xr.DataArray(obs_index, dims=["obs"])
-    obs_metadata = {"file_path": np.array(bw_files), "obs": obs_array}
+    # Create obs and var DataFrames.
+    obs_df = pd.DataFrame(
+        {"file_path": bw_files},
+        index=[os.path.basename(file).rpartition(".")[0].replace(".", "_") for file in bw_files]
+    )
+    var_df = consensus_peaks.set_index("region")
+    var_df["chunk_index"] = np.arange(var_df.shape[0]) // chunk_size
     
-    var_index = consensus_peaks["region"].to_numpy()
-    chunk_index = np.arange(consensus_peaks.shape[0]) // chunk_size
-    var_metadata = {
-        "chr": consensus_peaks["chrom"].to_numpy(),
-        "start": consensus_peaks["start"].to_numpy(),
-        "end": consensus_peaks["end"].to_numpy(),
-        "region": var_index,
-        "chunk_index": chunk_index
-    }
-    
+    # Write X into memory via the helper function.
+    # (Note: _load_x_to_memory still writes to a temporary HDF5 file internally,
+    #  but we use the resulting X in memory.)
     X = _load_x_to_memory(
-            bw_files, consensus_peaks, target, target_region_width,
-            out_path=str(backed_path), obs_index=obs_index, var_index=var_index,
-            chunk_size=chunk_size, n_bins=n_bins)
+        bw_files, consensus_peaks, target, target_region_width,
+        out_path="temporary_file.h5",  # temporary file; not used for final storage
+        obs_index=obs_df.index, var_index=var_df.index,
+        chunk_size=chunk_size, n_bins=n_bins
+    )
+    print(var_df)
+    print(X.shape)
+    # Build extra data variables from the obs and var DataFrames.
+    extra_vars = {}
+    # Store each obs column as an individual data variable.
+    obs_df.columns = [str(x) for x in obs_df.columns]
+    for col in obs_df.columns:
+        extra_vars[f"obs/{col}"] = xr.DataArray(obs_df[col].values, dims=["obs"])
+    extra_vars["obs/index"] = xr.DataArray(obs_df.index.values, dims=["obs"])
     
-    # Create the CrAnData object without any pandas DataFrames.
-    adata = CrAnData(X=X, obs=obs_metadata, var=var_metadata, uns=None, obsm=None, varm=None, layers=None,
-                     axis_indices={"obs": obs_index, "var": var_index},
-                     global_axis_order=["var", "obs"])
-    adata.uns = {'params': {
+    # Similarly, store each var column.
+    var_df.columns = [str(x) for x in var_df.columns]
+    for col in var_df.columns:
+        extra_vars[f"var/{col}"] = xr.DataArray(var_df[col].values, dims=["var"])
+    extra_vars["var/index"] = xr.DataArray(var_df.index.values, dims=["var"])
+    
+    # Create the CrAnData object by merging X and the extra variables.
+    adata = CrAnData(X=X, **extra_vars,always_convert_df = ['obs','var'])
+    
+    # Save additional parameters in the attributes.
+    adata.attrs["params"] = json.dumps({
         'target_region_width': target_region_width,
-        'shifted_region_width': target_region_width + 2 * max_stochastic_shift,
+        'shifted_region_width': shifted_width,
         'max_stochastic_shift': max_stochastic_shift,
         'chunk_size': chunk_size
-    }}
-    adata.to_h5(str(backed_path))
-    adata = CrAnData.from_h5(backed_path, backed=["X"])
+    })
+    
+    # Write out the CrAnData object as a NetCDF file.
+    adata.to_netcdf(str(backed_path))
+    # Reload the dataset using the open_dataset class method.
+    adata = CrAnData.open_dataset(str(backed_path))
     return adata
+
 
 # -----------------------
 # Additional utility functions
 # -----------------------
-
 def prepare_intervals(adata):
     """
     Prepare sorted interval data structures from adata.var.
-    Assumes adata.var is a dictionary of arrays.
+    Assumes adata.var has columns "chrom", "start", and "end".
+    Returns a dictionary {chrom: [(start, end, var_name), ... sorted by start]}.
     """
-    # Here we assume that adata.var["chr"], ["start"], and ["end"] are available as numpy arrays.
-    chr_arr = np.array(adata.var["chr"])
-    start_arr = np.array(adata.var["start"])
-    end_arr = np.array(adata.var["end"])
-    # Create a list of region names from the "region" array.
-    var_names = np.array(adata.var["region"])
+    df = pd.DataFrame({
+        "chrom": adata.var["chrom"].astype(str),
+        "start": adata.var["start"],
+        "end": adata.var["end"]
+    }, index=adata.var.index)
+    df = df.sort_values(["chrom", "start"])
     
-    intervals = defaultdict(list)
-    # Sort by chromosome and start.
-    order = np.lexsort((start_arr, chr_arr))
-    for idx in order:
-        intervals[chr_arr[idx]].append((start_arr[idx], end_arr[idx], var_names[idx]))
-    return dict(intervals)
+    chrom_intervals = defaultdict(list)
+    for idx, row in df.iterrows():
+        chrom_intervals[row["chrom"]].append((row["start"], row["end"], idx))
+    return dict(chrom_intervals)
 
 def _find_overlaps_in_sorted_bed(bed_df, chrom_intervals):
-    # (Unchanged: assumes bed_df is created from external files)
+    """
+    Given a bed_df with columns ["chrom", "start", "end", "row_idx"] sorted by (chr, start)
+    and a dictionary of sorted intervals, returns a dict: {row_idx -> [var_names overlapping]}.
+    """
     row_to_overlaps = defaultdict(list)
     chrom_positions = defaultdict(int)
     for _, row in bed_df.iterrows():
-        chrom = row["chr"]
+        chrom = row["chrom"]
         start_q = row["start"]
         end_q = row["end"]
         row_idx = row["row_idx"]
@@ -367,38 +512,42 @@ def _find_overlaps_in_sorted_bed(bed_df, chrom_intervals):
     return row_to_overlaps
 
 def _find_overlaps_for_bedp(bedp_df, chrom_intervals, coord_col_prefix):
+    """
+    Given a bedp dataframe and a coordinate prefix (e.g. "chr1","start1","end1"),
+    build a mapping (row index -> list of overlapping var names).
+    """
     df = bedp_df[[f"{coord_col_prefix}", f"start{coord_col_prefix[-1]}", f"end{coord_col_prefix[-1]}", "row_idx"]].copy()
     df = df.rename(columns={
-        f"{coord_col_prefix}": "chr",
+        f"{coord_col_prefix}": "chrom",
         f"start{coord_col_prefix[-1]}": "start",
         f"end{coord_col_prefix[-1]}": "end"
     })
-    df = df.sort_values(["chr", "start"]).reset_index(drop=True)
+    df = df.sort_values(["chrom", "start"]).reset_index(drop=True)
     return _find_overlaps_in_sorted_bed(df, chrom_intervals)
 
 def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
     """
     Read Hi-C BEDP files and add a Hi-C contact data array into adata.varp[key].
+    Computes overlaps with adata.var (consensus regions) and builds a 3D array,
+    then wraps it in an xarray DataArray.
     """
-    # Here we assume that adata.var is a dictionary of numpy arrays.
-    if "chr" not in adata.var:
-        # Fallback conversion if needed.
-        adata.var["chr"] = np.array([x.split(":")[0] for x in adata.var["region"]])
-        adata.var["start"] = np.array([int(x.split(":")[1].split("-")[0]) for x in adata.var["region"]])
-        adata.var["end"] = np.array([int(x.split(":")[1].split("-")[1]) for x in adata.var["region"]])
+    if "chrom" not in adata.var.columns:
+        print(adata.var)
+        var_index = adata.var.index.astype(str)
+        adata.var["chrom"] = var_index.str.split(":").str[0]
+        adata.var["start"] = var_index.str.split(":").str[1].str.split("-").str[0].astype(int)
+        adata.var["end"] = var_index.str.split(":").str[1].str.split("-").str[1].astype(int)
     
     chrom_intervals = prepare_intervals(adata)
-    num_bins = adata.var["region"].shape[0]
+    num_bins = adata.var.shape[0]
     num_files = len(bedp_files)
-    var_names = adata.var["region"]
-    var_name_to_i = {var: i for i, var in enumerate(var_names)}
+    var_name_to_i = {v: i for i, v in enumerate(adata.var.index)}
     
     all_rows = []
     all_cols = []
     all_file_idx = []
     all_data = []
     
-    import pandas as pd
     for fidx, bedp_file in enumerate(bedp_files):
         bedp_df = pd.read_csv(
             bedp_file, sep="\t", header=None,
@@ -406,16 +555,18 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
         ).reset_index(drop=True)
         bedp_df["row_idx"] = bedp_df.index
         
+        # Process first coordinate.
         bedp_first = (
             bedp_df[["chr1", "start1", "end1", "row_idx"]]
-            .rename(columns={"chr1": "chr", "start1": "start", "end1": "end"})
-            .sort_values(["chr", "start"])
+            .rename(columns={"chr1": "chrom", "start1": "start", "end1": "end"})
+            .sort_values(["chrom", "start"])
             .reset_index(drop=True)
         )
+        # Process second coordinate.
         bedp_second = (
             bedp_df[["chr2", "start2", "end2", "row_idx"]]
-            .rename(columns={"chr2": "chr", "start2": "start", "end2": "end"})
-            .sort_values(["chr", "start"])
+            .rename(columns={"chr2": "chrom", "start2": "start", "end2": "end"})
+            .sort_values(["chrom", "start"])
             .reset_index(drop=True)
         )
         
@@ -449,23 +600,16 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
     
     size = (num_bins, num_bins, num_files)
     indices = np.stack([all_rows, all_cols, all_file_idx], axis=0)
-    from sparse import COO
-    contacts_tensor = COO(indices, all_data, shape=size)
+    contacts_tensor = sparse.COO(indices, all_data, shape=size)
     
     contacts_xr = xr.DataArray(
         contacts_tensor,
-        dims=["var", "var_target", "obs"],
+        dims=["var", "var_1", "hic_file"],
         coords={
-            "var": var_names,
-            "var_target": var_names,
-            "obs": np.array([os.path.basename(x).replace('.bedp','') for x in bedp_files])
+            "var": np.array(adata.var.index),
+            "var_1": np.array(adata.var.index),
+            "hic_file": np.arange(contacts_tensor.shape[2])
         }
     )
-    
-    if "varp" not in adata._data or adata._data["varp"] is None:
-        adata._data["varp"] = {}
-        adata._create_dynamic_property("varp", convert_to_dataframe=False)
-    adata._data["varp"][key] = contacts_xr
-    adata.add_property("varp", adata._data["varp"])
-    
+    adata[f"varp/{key}"] = contacts_xr
     return contacts_xr

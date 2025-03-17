@@ -7,69 +7,71 @@ load data from your Yanndata files.
 from __future__ import annotations
 from os import PathLike
 import numpy as np
-from ._genome import Genome, _resolve_genome  # Just copied from crested
-from anndata import AnnData
+from ._genome import Genome, _resolve_genome
 from .crandata import CrAnData
 from ._dataloader import AnnDataLoader
-from ._dataset import AnnDataset, MetaAnnDataset
+from ._dataset import AnnDataset, MetaAnnDataset, get_obs_df, get_var_df
 from collections import defaultdict
 
 def set_stage_sample_probs(adata: CrAnData, stage: str):
+    # Rebuild the var DataFrame from the new CrAnData.
+    var_df = get_var_df(adata)
     required_cols = ["split"]
     for c in required_cols:
-        if c not in adata.var:
+        if c not in var_df.columns:
             raise KeyError(f"Missing column {c} in adata.var")
-    sample_probs = np.zeros(adata.n_var, dtype=float)
+    sample_probs = np.zeros(var_df.shape[0], dtype=float)
     if stage == "train":
-        mask = (adata.var["split"] == "train")
-        if "train_probs" not in adata.var:
-            adata.var["train_probs"] = xr.DataArray(np.ones)
-        adata.var["train_probs"] = adata.var["train_probs"] / adata.var["train_probs"].sum()
-        sample_probs[mask] = adata.var["train_probs"][mask].values
-        adata.var["sample_probs"] = sample_probs / sample_probs.sum()
-        mask = (adata.var["split"] == "val")
-        adata.var["val_probs"] = mask.astype(float)
-        adata.var["val_probs"] = adata.var["val_probs"] / adata.var["val_probs"].sum()
+        mask = (var_df["split"] == "train")
+        if "train_probs" not in var_df.columns:
+            var_df["train_probs"] = 1.0
+        var_df["train_probs"] = var_df["train_probs"] / var_df["train_probs"].sum()
+        sample_probs[mask] = var_df["train_probs"][mask].values
+        var_df["sample_probs"] = sample_probs / sample_probs.sum()
+        mask = (var_df["split"] == "val")
+        var_df["val_probs"] = mask.astype(float)
+        var_df["val_probs"] = var_df["val_probs"] / var_df["val_probs"].sum()
     elif stage == "test":
-        mask = (adata.var["split"] == "test")
-        adata.var["test_probs"] = mask.astype(float)
-        adata.var["test_probs"] = adata.var["test_probs"] / adata.var["test_probs"].sum()
+        mask = (var_df["split"] == "test")
+        var_df["test_probs"] = mask.astype(float)
+        var_df["test_probs"] = var_df["test_probs"] / var_df["test_probs"].sum()
     elif stage == "predict":
-        adata.var["predict_probs"] = 1.0
-        adata.var["predict_probs"] = adata.var["predict_probs"] / adata.var["predict_probs"].sum()
+        var_df["predict_probs"] = 1.0
+        var_df["predict_probs"] = var_df["predict_probs"] / var_df["predict_probs"].sum()
     else:
         print("Invalid stage, sample probabilities unchanged")
-
+    # Write back each updated column to adata (as a separate data variable).
+    for col in var_df.columns:
+        adata[f"var/{col}"] = type(adata)(data_vars={col: var_df[col].values}, coords={"var": var_df.index})
 
 class AnnDataModule:
     """
-    DataModule that wraps an AnnData (CrAnData) object using AnnDataset with a unified data_sources interface.
+    DataModule that wraps a CrAnData object using AnnDataset with a unified data_sources interface.
     
-    Parameters:
-      adata : CrAnData
-          CrAnData object containing the data.
-      genome : PathLike | Genome | None
-          Genome instance or FASTA path.
-      chromsizes_file : PathLike | None
-          Path to chromsizes file.
-      in_memory : bool
-          If True, load sequences into memory.
-      always_reverse_complement : bool
-          If True, always add reverse complement sequences.
-      random_reverse_complement : bool
-          If True, randomly reverse complement during training.
-      max_stochastic_shift : int
-          Maximum random shift.
-      deterministic_shift : bool
-          Use legacy shifting if True.
-      shuffle : bool
-          Whether to shuffle training data.
-      shuffle_obs : bool
-          Whether to shuffle the obs dimension of each batch.
-      batch_size : int
-          Samples per batch.
-      data_sources : dict[str, str]
-          Mapping of keys to data sources.
+    Parameters
+    ----------
+    adata : CrAnData
+        CrAnData object containing the data.
+    genome : PathLike | Genome | None
+        Genome instance or FASTA path.
+    chromsizes_file : PathLike | None
+        Path to chromsizes file.
+    in_memory : bool
+        If True, load sequences into memory.
+    always_reverse_complement : bool
+        If True, always add reverse complement sequences.
+    random_reverse_complement : bool
+        If True, randomly reverse complement during training.
+    max_stochastic_shift : int
+        Maximum random shift.
+    deterministic_shift : bool
+        Use legacy shifting if True.
+    shuffle : bool
+        Whether to shuffle training data.
+    batch_size : int
+        Samples per batch.
+    data_sources : dict[str, str]
+        Mapping of keys to data sources.
     """
     def __init__(
         self,
@@ -84,6 +86,7 @@ class AnnDataModule:
         shuffle: bool = True,
         batch_size: int = 256,
         data_sources: dict[str, str] = {'y': 'X'},
+        shuffle_obs: bool = False,
     ):
         self.adata = adata
         self.genome = _resolve_genome(genome, chromsizes_file)
@@ -93,7 +96,7 @@ class AnnDataModule:
         self.max_stochastic_shift = max_stochastic_shift
         self.deterministic_shift = deterministic_shift
         self.shuffle = shuffle
-        self.shuffle_obs = False  # Ensure this is defined (or passed in)
+        self.shuffle_obs = shuffle_obs
         self.batch_size = batch_size
         self.data_sources = data_sources
 
@@ -104,8 +107,9 @@ class AnnDataModule:
 
     @staticmethod
     def _split_anndata(adata: CrAnData, split: str) -> CrAnData:
+        var_df = get_var_df(adata)
         if split:
-            if "split" not in adata.var.columns:
+            if "split" not in var_df.columns:
                 raise KeyError("No split column found in adata.var. Run the appropriate pre-processing.")
         return adata
 
@@ -163,7 +167,6 @@ class AnnDataModule:
             shuffle=self.shuffle,
             shuffle_obs=self.shuffle_obs,
             drop_remainder=False,
-            epoch_size=100_000,
             stage='train'
         )
 
@@ -176,7 +179,6 @@ class AnnDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             drop_remainder=False,
-            epoch_size=100_000,
             stage='val'
         )
 
@@ -189,7 +191,6 @@ class AnnDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             drop_remainder=False,
-            epoch_size=100_000,
             stage='test'
         )
 
@@ -202,13 +203,12 @@ class AnnDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             drop_remainder=False,
-            epoch_size=100_000,
             stage='predict'
         )
 
     def __repr__(self):
         return (
-            f"AnnDataModule(adata_shape={self.adata.shape}, genome={self.genome}, "
+            f"AnnDataModule(adata_shape={self.adata['X'].shape}, genome={self.genome}, "
             f"in_memory={self.in_memory}, always_reverse_complement={self.always_reverse_complement}, "
             f"random_reverse_complement={self.random_reverse_complement}, max_stochastic_shift={self.max_stochastic_shift}, "
             f"shuffle={self.shuffle}, batch_size={self.batch_size})"
@@ -217,16 +217,14 @@ class AnnDataModule:
 
 class MetaAnnDataModule:
     """
-    DataModule for combining multiple AnnData objects (e.g. one per species)
-    into a single MetaAnnDataset for global weighted sampling.
+    DataModule for combining multiple CrAnData objects into a single MetaAnnDataset for global weighted sampling.
 
-    Each AnnData (ideally a CrAnData) is first wrapped in an AnnDataset, and then the 
-    resulting datasets are merged into a MetaAnnDataset.
+    Each CrAnData is wrapped in an AnnDataset, and then the resulting datasets are merged into a MetaAnnDataset.
 
     Parameters
     ----------
     adatas : list[CrAnData]
-        Each species/dataset stored in its own CrAnData.
+        Each dataset stored in its own CrAnData.
     genomes : list[Genome]
         Matching list of genome references.
     data_sources : dict[str, str], default {'y': 'X'}
@@ -276,28 +274,46 @@ class MetaAnnDataModule:
         self.epoch_size = epoch_size
         self.shuffle_obs = shuffle_obs
 
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
-        self.predict_dataset = None
-        
-        # Compute observation names alignment across adatas:
+        # Compute observation names alignment across adatas.
         if obs_alignment == 'union':
-            meta_obs_names = np.array(sorted(set().union(*[set(adata.obs_names) for adata in self.adatas])))
+            meta_obs_names = np.array(sorted(set().union(*[set(get_obs_df(adata).index) for adata in self.adatas])))
         elif obs_alignment == 'intersect':
-            meta_obs_names = np.array(sorted(set.intersection(*[set(adata.obs_names) for adata in self.adatas])))
+            meta_obs_names = np.array(sorted(set.intersection(*[set(get_obs_df(adata).index) for adata in self.adatas])))
         else:
             raise ValueError("obs_alignment must be 'union' or 'intersect'")
         self.meta_obs_names = meta_obs_names
         for adata in self.adatas:
             adata.meta_obs_names = self.meta_obs_names
 
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+        self.predict_dataset = None
+        
+        def dataset_args(split):
+            return {
+                "in_memory": self.in_memory,
+                "data_sources": self.data_sources,
+                "always_reverse_complement": False,
+                "random_reverse_complement": self.random_reverse_complement,
+                "max_stochastic_shift": self.max_stochastic_shift,
+                "deterministic_shift": self.deterministic_shift,
+                "split": split,
+            }
+        # Setup for 'fit' stage:
+        if hasattr(self, "stage") and self.stage == "fit":
+            pass  # stage is not pre-defined here; see below.
+        else:
+            # We'll determine stage based on the setup call.
+            pass
+
+        # The setup() method is used to construct the per-stage datasets.
     def setup(self, stage: str) -> None:
         def dataset_args(split):
             return {
                 "in_memory": self.in_memory,
                 "data_sources": self.data_sources,
-                "always_reverse_complement": False,  # Disable augmentation by default in meta mode
+                "always_reverse_complement": False,
                 "random_reverse_complement": self.random_reverse_complement,
                 "max_stochastic_shift": self.max_stochastic_shift,
                 "deterministic_shift": self.deterministic_shift,
@@ -322,13 +338,13 @@ class MetaAnnDataModule:
             self.val_dataset = MetaAnnDataset(val_datasets)
             
             for ds in self.train_dataset.datasets:
-                if "chunk_index" in ds.adata.var.columns:
+                var_df = get_var_df(ds.adata)
+                if "chunk_index" in var_df.columns:
                     chunk_groups = defaultdict(list)
-                    for local_idx, chunk in enumerate(ds.adata.var["chunk_index"].to_numpy()):
+                    for local_idx, chunk in enumerate(var_df["chunk_index"].to_numpy()):
                         chunk_groups[chunk].append(local_idx)
                 else:
-                    # If missing, assume all variables belong to one chunk.
-                    chunk_groups = {0: list(range(len(ds.adata.var)))}
+                    chunk_groups = {0: list(range(len(var_df)))}
                 ds.chunk_groups = dict(chunk_groups)
                 ds.chunk_weights = {ch: ds.augmented_probs[indices].sum()
                                     for ch, indices in ds.chunk_groups.items()}
@@ -427,6 +443,6 @@ class MetaAnnDataModule:
             f"MetaAnnDataModule(num_species={len(self.adatas)}, batch_size={self.batch_size}, "
             f"shuffle={self.shuffle}, max_stochastic_shift={self.max_stochastic_shift}, "
             f"random_reverse_complement={self.random_reverse_complement}, "
-            f"in_memory={self.in_memory}, "
-            f"deterministic_shift={self.deterministic_shift}, epoch_size={self.epoch_size})"
+            f"in_memory={self.in_memory}, deterministic_shift={self.deterministic_shift}, "
+            f"epoch_size={self.epoch_size})"
         )
