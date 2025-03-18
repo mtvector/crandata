@@ -9,8 +9,7 @@ from pathlib import Path
 from loguru import logger
 from pysam import FastaFile
 
-from . import _conf
-from .utils import reverse_complement
+from .seq_io import reverse_complement
 
 
 class Genome:
@@ -196,33 +195,6 @@ class Genome:
         else:
             return seq
 
-
-def register_genome(genome: Genome):
-    """
-    Register a genome to be used throughout a session.
-
-    Once a genome is registered, all the functions in the package that require a genome will use it if not explicitly provided.
-
-    Parameters
-    ----------
-    genome
-        The Genome object to register.
-
-    Examples
-    --------
-    >>> genome = Genome(
-    ...     fasta="tests/data/hg38.fa",
-    ...     chrom_sizes="tests/data/test.chrom.sizes",
-    ... )
-    >>> register_genome(genome)
-    INFO Genome hg38 registered.
-    """
-    if not isinstance(genome, Genome):
-        raise TypeError("genome must be an instance of crested.Genome")
-    _conf.genome = genome
-    logger.info(f"Genome {genome.name} registered.")
-
-
 def _resolve_genome(
     genome: os.PathLike | Genome | None,
     chromsizes_file: os.PathLike | None = None,
@@ -241,7 +213,4 @@ def _resolve_genome(
             fasta=genome_path, chrom_sizes=chromsizes_file, annotation=annotation
         )
     else:
-        if _conf.genome is not None:
-            return _conf.genome
-        else:
-            raise ValueError("No genome provided or registered.")
+        raise ValueError("No genome provided.")

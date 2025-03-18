@@ -10,7 +10,6 @@ import pandas as pd
 import pybigtools
 from loguru import logger
 from tqdm import tqdm
-from . import _conf
 from collections import defaultdict
 import xarray as xr
 import sparse
@@ -118,7 +117,7 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
             return values
 
 def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = None) -> pd.DataFrame:
-    if chromsizes_dict is None and not _conf.genome:
+    if chromsizes_dict is None:
         logger.warning("Chromsizes file not provided. Will not check if regions are within chromosomes", stacklevel=1)
     consensus_peaks = pd.read_csv(
         regions_file,
@@ -133,8 +132,6 @@ def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = N
                                 consensus_peaks["end"].astype(str)
     if chromsizes_dict:
         pass
-    elif _conf.genome:
-        chromsizes_dict = _conf.genome.chrom_sizes
     else:
         return consensus_peaks
     valid_mask = consensus_peaks.apply(

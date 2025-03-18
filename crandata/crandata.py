@@ -67,16 +67,6 @@ class CrAnData(xr.Dataset):
                 setattr(self, group_key, grouped)
 
     @property
-    def always_convert_df(self):
-        # Bypass __getitem__ by directly accessing the underlying _variables dict.
-        d = object.__getattribute__(self, "_variables")
-        arr = d["always_convert_df"]
-        try:
-            return arr.data.tolist()
-        except AttributeError:
-            return arr.data
-
-    @property
     def array_names(self):
         return list(self.data_vars.keys())
     
@@ -203,7 +193,46 @@ class CrAnData(xr.Dataset):
         else:
             always_convert = []
         return cls(data_vars=new_vars, coords=obj.coords, always_convert_df=always_convert)
-    
+
+    @property
+    def always_convert_df(self):
+        # Bypass __getitem__ by directly accessing the underlying _variables dict.
+        d = object.__getattribute__(self, "_variables")
+        arr = d["always_convert_df"]
+        try:
+            return arr.data.tolist()
+        except AttributeError:
+            return arr.data
+
+    @always_convert_df.setter
+    def always_convert_df(self, new_value):
+        """
+        Update the always_convert_df setting.
+        
+        This setter expects new_value to be a list. It creates a new DataArray
+        for the provided list, updates the underlying storage, and then refreshes
+        any external attributes (like adata.obs or adata.var) to reflect the new list.
+        """
+        new_list = list(new_value)
+        new_da = xr.DataArray(new_list, dims=("item",))
+        d = object.__getattribute__(self, "_variables")
+        d["always_convert_df"] = new_da
+
+        # Remove any previously set external attributes that are not in the new list.
+        # (They were set during __init__ or via a previous call.)
+        old_keys = set(self.__dict__.keys()).intersection(set(["obs", "var"]))
+        for key in old_keys:
+            if key not in new_list:
+                try:
+                    delattr(self, key)
+                except Exception:
+                    pass
+        # Set (or update) attributes for each key in the new always_convert_df list.
+        for key in new_list:
+            grouped = self.get_dataframe(key)
+            if grouped is not None:
+                setattr(self, key, grouped)
+                
     @classmethod
     def open_dataset(cls, path, **kwargs):
         ds = xr.open_dataset(path, **kwargs)
