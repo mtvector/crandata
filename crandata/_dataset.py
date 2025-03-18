@@ -220,10 +220,10 @@ class AnnDataset(BaseClass):
 
         # Get X from the dataset (assumed stored under key "X")
         X = self.adata["X"]
-        # Assign coordinates using the reconstructed indices.
-        X = X.assign_coords(obs=("obs", np.array(obs_df.index)),
-                            var=("var", np.array(var_df.index)))
-        self.adata["X"] = X  # update stored X
+        # # Assign coordinates using the reconstructed indices.
+        # X = X.assign_coords(obs=("obs", np.array(obs_df.index)),
+        #                     var=("var", np.array(var_df.index)))
+        # self.adata["X"] = X  # update stored X
 
         self.uns = {}  # New CrAnData does not support uns by default.
         self.layers = {}  # Similarly, layers and varp/obsm default to empty.
@@ -273,65 +273,125 @@ class AnnDataset(BaseClass):
             var_idx = self.index_map[original_region]
             self.augmented_probs[i] = probs[var_idx]
 
+    def _get_data_array(self, source_str: str, varname: str, shift: int = 0):
+        """
+        Retrieve data from the CrAnData object using source_str as a key.
+        
+        For data sources that are expected to provide one value per region (e.g. "X" or "layers/...")
+        the function indexes along the "var" dimension using self.index_map[varname]. In those cases,
+        if the DataArray has a "seq_len" dimension, it is sliced (and padded or truncated) to have
+        exactly self.region_width along that dimension.
+        
+        For data sources such as those starting with "varp/" (e.g. Hi-C contact data),
+        no indexing along the "var" dimension is done, and the full array is returned.
+        
+        Returns the underlying NumPy array.
+        """
+        try:
+            data_array = self.adata[source_str]
+        except KeyError:
+            raise ValueError(f"Data source {source_str} not found in CrAnData object.")
+        
+        if "var" in data_array.dims:
+            var_idx = self.index_map[varname]
+            data_array = data_array.isel(var=var_idx)
+    
+        # If the array has a "seq_len" dimension, slice and pad/truncate.
+        if "seq_len" in data_array.dims:
+            start_idx = self.max_stochastic_shift + shift
+            end_idx = start_idx + self.region_width
+            data_array = data_array.isel(seq_len=slice(start_idx, end_idx))
+            data_np = data_array.data
+            seq_axis = data_array.get_axis_num("seq_len")
+            current_len = data_np.shape[seq_axis]
+            if current_len < self.region_width:
+                pad_width = [(0, 0)] * data_np.ndim
+                pad_width[seq_axis] = (0, self.region_width - current_len)
+                data_np = np.pad(data_np, pad_width, mode="constant", constant_values=np.nan)
+            elif current_len > self.region_width:
+                slicer = [slice(None)] * data_np.ndim
+                slicer[seq_axis] = slice(0, self.region_width)
+                data_np = data_np[tuple(slicer)]
+            return data_np
+        else:
+            # For sources like "varp/...", do not index along "var" or slice "seq_len".
+            return data_array.data
+
     def __getitem__(self, idx: int) -> dict:
         if not isinstance(idx, int):
             raise IndexError("Index must be an integer.")
+            
+        # Retrieve the augmented index and map it to the original region.
         augmented_index = self.index_manager.augmented_indices[idx]
         original_index = self.index_manager.augmented_indices_map[augmented_index]
+        
+        # Apply a random shift for augmentation.
         shift = (np.random.randint(-self.max_stochastic_shift, self.max_stochastic_shift + 1)
                  if self.max_stochastic_shift > 0 else 0)
+        
+        # Get the genomic sequence (one-hot encoded).
         x_seq = self.sequence_loader.get_sequence(augmented_index, stranded=True, shift=shift)
         if self.random_reverse_complement and np.random.rand() < 0.5:
             x_seq = self.sequence_loader._reverse_complement(x_seq)
         seq_onehot = one_hot_encode_sequence(x_seq, expand_dim=False)
         item = {"sequence": seq_onehot}
+        
         for key, source_str in self.data_sources.items():
             if key == "sequence":
                 continue
-            if source_str in ["X"] or source_str.startswith("layers/") or source_str.startswith("varp/"):
-                item[key] = self._get_data_array(source_str, original_index, shift=shift)
+            # # For global data sources (e.g. hi-C from varp/hic_contacts), return the full array.
+            if source_str.startswith("obsm"):
+                item[key] = self.adata[source_str].data
+            # For observation metadata, extract the column from the obs DataFrame.
             elif source_str.startswith("obs/"):
                 col = source_str.split("/", 1)[1]
                 item[key] = get_obs_df(self.adata)[col].values
-            elif source_str.startswith("obsm/"):
-                key_name = source_str.split("/", 1)[1]
-                # For simplicity, assume obsm is empty in the new version.
-                item[key] = None
             else:
-                raise ValueError(f"Unknown data source prefix in '{source_str}'")
+                # For keys like "X" or "layers/...", index along "var" and slice seq_len as needed.
+                item[key] = self._get_data_array(source_str, original_index, shift=shift)
+                print('getitem',key,item[key].shape)
         return item
 
     def _get_data_array(self, source_str: str, varname: str, shift: int = 0):
-        var_idx = self.index_map[varname]
-        if source_str == "X":
-            lazy_obj = self.adata["X"].data
-            if hasattr(lazy_obj, "filename"):
-                key = (slice(None), var_idx)
-                return LazyData(lazy_obj, key,
-                                local_obs=np.array(get_obs_df(self.adata).index),
-                                global_obs=np.array(self.meta_obs_names))
-            else:
-                return self.adata["X"][:, var_idx]
-        elif source_str.startswith("layers/"):
-            key_name = source_str.split("/", 1)[1]
+        """
+        Retrieve data from the CrAnData object using source_str as a key.
+        
+        For DataArrays with a "var" dimension, index along that dimension using self.index_map[varname].
+        If the array has a "seq_len" dimension, slice along it using:
+             start = self.max_stochastic_shift + shift
+             end   = start + self.region_width
+        Then pad or truncate so that the "seq_len" dimension is exactly self.region_width.
+        
+        Returns the underlying NumPy array.
+        """
+        try:
+            data_array = self.adata[source_str]
+        except KeyError:
+            raise ValueError(f"Data source {source_str} not found in CrAnData object.")
+        
+        if "var" in data_array.dims:
+            var_idx = self.index_map[varname]
+            data_array = data_array.isel(var=var_idx)
+            print(data_array)
+        
+        if "seq_len" in data_array.dims:
             start_idx = self.max_stochastic_shift + shift
             end_idx = start_idx + self.region_width
-            if key_name in self.layers and hasattr(self.layers[key_name].data, "filename"):
-                lazy_obj = self.layers[key_name].data
-                key_tuple = (self.meta_obs_names, var_idx, slice(start_idx, end_idx))
-                return LazyData(lazy_obj, key_tuple,
-                                local_obs=np.array(get_obs_df(self.adata).index),
-                                global_obs=np.array(self.meta_obs_names))
-            return self.layers.get(key_name)[self.meta_obs_names, var_idx][..., start_idx:end_idx]
-        elif source_str.startswith("varp/"):
-            key_name = source_str.split("/", 1)[1]
-            if key_name in self.uns and hasattr(self.uns[key_name].data, "filename"):
-                lazy_obj = self.uns[key_name].data
-                key_tuple = (var_idx,)
-                return LazyData(lazy_obj, key_tuple)
-            return self.uns.get(key_name)[var_idx]
+            data_array = data_array.isel(seq_len=slice(start_idx, end_idx))
+            data_np = data_array.data
+            seq_axis = data_array.get_axis_num("seq_len")
+            current_len = data_np.shape[seq_axis]
+            if current_len < self.region_width:
+                pad_width = [(0, 0)] * data_np.ndim
+                pad_width[seq_axis] = (0, self.region_width - current_len)
+                data_np = np.pad(data_np, pad_width, mode="constant", constant_values=np.nan)
+            elif current_len > self.region_width:
+                slicer = [slice(None)] * data_np.ndim
+                slicer[seq_axis] = slice(0, self.region_width)
+                data_np = data_np[tuple(slicer)]
+            return data_np
         else:
-            raise ValueError(f"Data source '{source_str}' is not indexable by variable.")
+            return data_array.data
 
     def __call__(self):
         for i in range(len(self)):
@@ -381,7 +441,8 @@ class MetaAnnDataset:
             ds_idx, local_i = global_idx
         else:
             ds_idx, local_i = self.global_indices[global_idx]
-        return self.datasets[int(ds_idx)][int(local_i)]
+        ds = self.datasets[int(ds_idx)]
+        return ds.__getitem__(int(local_i))
 
     def __repr__(self):
         return (f"MetaAnnDataset(num_datasets={len(self.datasets)}, total_augmented_indices={len(self.global_indices)})")

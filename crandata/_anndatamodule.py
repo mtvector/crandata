@@ -12,6 +12,7 @@ from .crandata import CrAnData
 from ._dataloader import AnnDataLoader
 from ._dataset import AnnDataset, MetaAnnDataset, get_obs_df, get_var_df
 from collections import defaultdict
+import xarray as xr
 
 def set_stage_sample_probs(adata: CrAnData, stage: str):
     # Rebuild the var DataFrame from the new CrAnData.
@@ -42,7 +43,8 @@ def set_stage_sample_probs(adata: CrAnData, stage: str):
         print("Invalid stage, sample probabilities unchanged")
     # Write back each updated column to adata (as a separate data variable).
     for col in var_df.columns:
-        adata[f"var/{col}"] = type(adata)(data_vars={col: var_df[col].values}, coords={"var": var_df.index})
+        if not col in adata.array_names:
+            adata[f"var/{col}"] = xr.DataArray(var_df[col].values, dims =('var',))
 
 class AnnDataModule:
     """

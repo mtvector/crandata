@@ -61,7 +61,7 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
                 temp_bed_file.write(line.encode("utf-8"))
                 bed_entries_to_keep_idx.append(idx)
     temp_bed_file.close()
-    total_bed_entries = idx + 1
+    total_bed_entries = len(bed_entries_to_keep_idx)
     bed_entries_to_keep_idx = np.array(bed_entries_to_keep_idx, np.intp)
     
     if target == "mean":
@@ -251,10 +251,10 @@ def _load_x_to_memory(bw_files, consensus_peaks, target, target_region_width,
     # Read the dataset into a NumPy array and wrap it in an xarray DataArray.
     with h5py.File(out_path, "r") as f:
         X_array = f["X"][:]
-    X = xr.DataArray(X_array, dims=["obs", "var", "seq_len"],
+    X = xr.DataArray(X_array, dims=["obs", "var", "seq_bins"],
                      coords={"obs": np.array(obs_index),
                              "var": np.array(var_index),
-                             "seq_len": np.arange(seq_len)})
+                             "seq_bins": np.arange(seq_len)})
     return X
 
 # def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
@@ -432,8 +432,6 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
         obs_index=obs_df.index, var_index=var_df.index,
         chunk_size=chunk_size, n_bins=n_bins
     )
-    print(var_df)
-    print(X.shape)
     # Build extra data variables from the obs and var DataFrames.
     extra_vars = {}
     # Store each obs column as an individual data variable.
@@ -441,7 +439,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     for col in obs_df.columns:
         extra_vars[f"obs/{col}"] = xr.DataArray(obs_df[col].values, dims=["obs"])
     extra_vars["obs/index"] = xr.DataArray(obs_df.index.values, dims=["obs"])
-    
+
     # Similarly, store each var column.
     var_df.columns = [str(x) for x in var_df.columns]
     for col in var_df.columns:
@@ -449,8 +447,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     extra_vars["var/index"] = xr.DataArray(var_df.index.values, dims=["var"])
     
     # Create the CrAnData object by merging X and the extra variables.
-    adata = CrAnData(X=X, **extra_vars,always_convert_df = ['obs','var'])
-    
+    adata = CrAnData(X=X, **extra_vars)#,always_convert_df = ['obs','var'])
     # Save additional parameters in the attributes.
     adata.attrs["params"] = json.dumps({
         'target_region_width': target_region_width,
@@ -471,15 +468,15 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
 # -----------------------
 def prepare_intervals(adata):
     """
-    Prepare sorted interval data structures from adata.var.
+    Prepare sorted interval data structures from adata.sizes['var']
     Assumes adata.var has columns "chrom", "start", and "end".
     Returns a dictionary {chrom: [(start, end, var_name), ... sorted by start]}.
     """
     df = pd.DataFrame({
-        "chrom": adata.var["chrom"].astype(str),
-        "start": adata.var["start"],
-        "end": adata.var["end"]
-    }, index=adata.var.index)
+        "chrom": adata["var/chrom"].data.astype(str),
+        "start": adata["var/start"].data,
+        "end": adata["var/end"].data
+    }, index=adata['var/index'].data)
     df = df.sort_values(["chrom", "start"])
     
     chrom_intervals = defaultdict(list)
@@ -531,17 +528,16 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
     Computes overlaps with adata.var (consensus regions) and builds a 3D array,
     then wraps it in an xarray DataArray.
     """
-    if "chrom" not in adata.var.columns:
-        print(adata.var)
-        var_index = adata.var.index.astype(str)
-        adata.var["chrom"] = var_index.str.split(":").str[0]
-        adata.var["start"] = var_index.str.split(":").str[1].str.split("-").str[0].astype(int)
-        adata.var["end"] = var_index.str.split(":").str[1].str.split("-").str[1].astype(int)
+    # if "chrom" not in adata.sizes['var']columns:
+    #     var_index = adata['var/index'].astype(str)
+    #     adata.var["chrom"] = var_index.str.split(":").str[0]
+    #     adata.var["start"] = var_index.str.split(":").str[1].str.split("-").str[0].astype(int)
+    #     adata.var["end"] = var_index.str.split(":").str[1].str.split("-").str[1].astype(int)
     
     chrom_intervals = prepare_intervals(adata)
-    num_bins = adata.var.shape[0]
+    num_bins = adata.sizes['var']
     num_files = len(bedp_files)
-    var_name_to_i = {v: i for i, v in enumerate(adata.var.index)}
+    var_name_to_i = {v: i for i, v in enumerate(adata['var/index'].data)}
     
     all_rows = []
     all_cols = []
@@ -604,11 +600,11 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
     
     contacts_xr = xr.DataArray(
         contacts_tensor,
-        dims=["var", "var_1", "hic_file"],
+        dims=["var", "var_1", "obs"],
         coords={
-            "var": np.array(adata.var.index),
-            "var_1": np.array(adata.var.index),
-            "hic_file": np.arange(contacts_tensor.shape[2])
+            "var": np.array(adata['var/index'].data),
+            "var_1": np.array(adata['var/index'].data),
+            "obs": np.array([os.path.basename(x).replace('.bedp','') for x in bedp_files])
         }
     )
     adata[f"varp/{key}"] = contacts_xr
