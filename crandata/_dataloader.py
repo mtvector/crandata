@@ -344,8 +344,6 @@ class AnnDataLoader:
                 perm = torch.randperm(obs_dim)
                 # Apply the same permutation to every key whose first dimension equals obs_dim.
                 for key in collated:
-                    print('batch len',len(batch))
-                    print(key,collated[key].shape)
                     if collated[key].ndim > 0 and collated[key].shape[0] == obs_dim:
                         collated[key] = collated[key][perm]
         if self.device is not None:
@@ -355,7 +353,9 @@ class AnnDataLoader:
                     # print('I permute',collated[key].shape)
                     collated[key] = collated[key].permute((1, 0) + tuple(range(2, collated[key].ndim)))
                     # print('new shape',collated[key].shape)
-        return collated
+        for k,v in collated.items():
+            print(k,type(v),v.dtype,torch.isnan(v).sum(),v)
+        return {k:v.float() for k,v in collated.items()}
     
     def _create_dataset(self):
         from torch.utils.data import DataLoader
