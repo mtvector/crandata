@@ -6,4 +6,4 @@ Proof of concept works as a dataloader, but doesn't play nicely with crested's f
 
 See [this notebook](tests/test_crandataloader.ipynb) for examples on how to create and use the class.
 
-There may or may not be further development of this class... (there will not, but check out __genomics_dataloading_repo__ soon)
+There may or may not be further development of this class... (there will not, but check out __grandata__ soon)
